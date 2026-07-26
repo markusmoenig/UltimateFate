@@ -1,0 +1,18 @@
+[package]
+name = "ultimate-fate-render"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ultimate_fate_render"
+
+[dependencies]
+bytemuck.workspace = true
+ultimate-fate-core = { path = "../game_core" }
+ultimate-fate-present = { path = "../game_present" }
+wgpu.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

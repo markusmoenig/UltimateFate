@@ -1,0 +1,22 @@
+[package]
+name = "ultimate-fate-lab"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ultimate_fate_lab"
+
+[[bin]]
+name = "ultimate-fate-lab"
+path = "src/main.rs"
+
+[dependencies]
+ultimate-fate-content = { path = "../game_content" }
+ultimate-fate-core = { path = "../game_core" }
+ultimate-fate-history = { path = "../history" }
+ultimate-fate-session = { path = "../game_session" }
+ultimate-fate-text = { path = "../game_text" }
+ultimate-fate-worldgen = { path = "../worldgen" }
+ultimate-fate-world-atlas = { path = "../world_atlas" }

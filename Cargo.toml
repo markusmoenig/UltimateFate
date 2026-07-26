@@ -1,0 +1,49 @@
+[workspace]
+members = [
+    "crates/game_content",
+    "crates/game_core",
+    "crates/game_session",
+    "crates/game_input",
+    "crates/game_lab",
+    "crates/world_atlas",
+    "crates/worldgen",
+    "crates/history",
+    "crates/game_text",
+    "crates/game_present",
+    "crates/game_render",
+    "crates/client_desktop",
+    "crates/client_apple",
+]
+default-members = [
+    "crates/game_content",
+    "crates/game_core",
+    "crates/game_session",
+    "crates/game_input",
+    "crates/game_lab",
+    "crates/world_atlas",
+    "crates/worldgen",
+    "crates/history",
+    "crates/game_text",
+    "crates/game_present",
+    "crates/game_render",
+    "crates/client_desktop",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "MPL-2.0"
+
+[workspace.dependencies]
+bytemuck = { version = "1.25.1", features = ["derive"] }
+pollster = "0.4"
+thiserror = "2.0.18"
+wgpu = "27.0.1"
+winit = "0.30.13"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

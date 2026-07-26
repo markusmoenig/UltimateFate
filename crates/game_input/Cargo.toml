@@ -1,0 +1,12 @@
+[package]
+name = "ultimate-fate-input"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ultimate_fate_input"
+
+[dependencies]
+ultimate-fate-core = { path = "../game_core" }

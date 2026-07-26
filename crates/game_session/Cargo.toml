@@ -1,0 +1,16 @@
+[package]
+name = "ultimate-fate-session"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ultimate_fate_session"
+
+[dependencies]
+ultimate-fate-content = { path = "../game_content" }
+ultimate-fate-core = { path = "../game_core" }
+ultimate-fate-history = { path = "../history" }
+ultimate-fate-text = { path = "../game_text" }
+ultimate-fate-worldgen = { path = "../worldgen" }

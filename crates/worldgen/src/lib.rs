@@ -6,19 +6,19 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use thiserror::Error;
-use ultimate_fate_content::{MaterialKind, WorldRules};
+use ultimate_fate_content::{FormulaId, MaterialKind, WorldRules};
 use ultimate_fate_core::{
-    AmmunitionKind, Combatant, Direction, Entity, EntityId, EntityKind, GameCommand,
-    GameplayBuildError, GridPos, Item, ItemId, ItemKind, Landmark, LandmarkKind, MapId, Quest,
-    QuestId, QuestObjective, QuestObjectiveKind, QuestStatus, RandomStream, Simulation,
-    SimulationBuildError, StreamId, TerrainCell, TerrainKind, Transition, TransitionKind, WorldMap,
-    WorldPosition,
+    AmmunitionKind, BookSubject, Combatant, Container, Direction, Entity, EntityId, EntityKind,
+    GameCommand, GameplayBuildError, GridPos, Item, ItemId, ItemKind, Landmark, LandmarkKind,
+    MapId, Quest, QuestId, QuestObjective, QuestObjectiveKind, QuestStatus, RandomStream,
+    Simulation, SimulationBuildError, StreamId, TerrainCell, TerrainKind, Transition,
+    TransitionKind, WorldMap, WorldPosition,
 };
 use ultimate_fate_history::{
     Drive, EntityRef, EventId, FactionId, HistoricalEventKind, HistoricalWorld, LawId, LawKind,
     Occupation, PartyId, PersonId, PhysicalEvidenceKind, ProjectId, RegionalGoalKind,
-    RegionalPartyKind, RegionalPartyStatus, RouteId, SettlementProjectKind, SettlementProjectPhase,
-    SiteId, WorldItemId,
+    RegionalPartyKind, RegionalPartyStatus, ResourceKind, RouteId, SettlementProjectKind,
+    SettlementProjectPhase, SiteId, WorldItemId,
 };
 use ultimate_fate_text::{BriefingSectionKind, CampaignStart, physical_evidence_name};
 use ultimate_fate_world_atlas::{AtlasPosition, Biome, WaterBody, WorldAtlas};
@@ -39,6 +39,17 @@ const FIELD_DRESSING: ItemId = ItemId(4);
 const DUNGEON_RELIC: ItemId = ItemId(0x1000);
 const DUNGEON_REAGENT_BASE: u64 = 0x1100;
 const ACCESS_MEDICINE: ItemId = ItemId(0x1200);
+const SHOP_SWORD: ItemId = ItemId(0x1300);
+const SHOP_ARROWS: ItemId = ItemId(0x1301);
+const SHOP_DRESSING: ItemId = ItemId(0x1302);
+const SHOP_REAGENT: ItemId = ItemId(0x1303);
+const PROVISION_CRATE_ENTITY: EntityId = EntityId(0xc000_0001);
+const LEDGER_CHEST_ENTITY: EntityId = EntityId(0xc000_0002);
+const PANTRY_BREAD: ItemId = ItemId(0x1400);
+const PANTRY_WATER: ItemId = ItemId(0x1401);
+const PANTRY_TOOL: ItemId = ItemId(0x1402);
+const SHOP_LEDGER: ItemId = ItemId(0x1403);
+const LEDGER_KEY: ItemId = ItemId(0x1404);
 const DUNGEON_QUEST: QuestId = QuestId(1);
 pub const LOCAL_DAY_TURNS: u64 = 240;
 const LOCAL_DAY_PHASE_OFFSET: u64 = 144;
@@ -46,6 +57,7 @@ const LOCAL_DAY_PHASE_OFFSET: u64 = 144;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocationSource {
     ContactWorkplace(PersonId),
+    ResidentWorkplace(PersonId),
     HistoricalEvidence(EventId),
     FactionSeat(FactionId),
     Dungeon(EventId),
@@ -167,6 +179,23 @@ pub struct PlannedAidSituation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedShop {
+    pub merchant: PersonId,
+    pub merchant_entity: EntityId,
+    pub merchant_name: String,
+    pub name: String,
+    pub stock: Vec<Item>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedContainer {
+    pub container: Container,
+    pub position: GridPos,
+    pub contents: Vec<Item>,
+    pub key: Option<Item>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlannedRegionalSite {
     pub site: SiteId,
     pub name: String,
@@ -210,6 +239,8 @@ pub struct PlayableSitePlan {
     pub evidence_description: String,
     pub encounter: PlannedEncounter,
     pub aid: PlannedAidSituation,
+    pub shop: PlannedShop,
+    pub containers: Vec<PlannedContainer>,
     pub dungeon: PlannedDungeon,
     pub living_projects: Vec<PlannedLivingProject>,
     pub regional_sites: Vec<PlannedRegionalSite>,
@@ -242,6 +273,8 @@ pub enum SitePlanError {
     InvalidGameplay(GameplayBuildError),
     #[error("generated site has fewer than three distinct residents for a local aid situation")]
     InsufficientAidActors,
+    #[error("generated site has no living merchant")]
+    MissingMerchant,
 }
 
 impl PlayableSitePlan {
@@ -278,6 +311,19 @@ impl PlayableSitePlan {
         let map = MapId(site_id.0 as u32);
         let contact_name = person_name(world, contact.id);
         let contact_location = workplace_name(world, contact.id, site.name.as_str());
+        let merchant = world
+            .living_people()
+            .filter(|person| person.home == site_id)
+            .min_by_key(|person| {
+                let suitability = match person.occupation {
+                    Occupation::Merchant => 0,
+                    Occupation::Innkeeper => 1,
+                    Occupation::Smith | Occupation::Miller => 2,
+                    _ => 3,
+                };
+                (suitability, person.id)
+            })
+            .ok_or(SitePlanError::MissingMerchant)?;
         let evidence_location = evidence_title(evidence.kind);
         let encounter = plan_encounter(world, crisis_event, transform);
         let crisis_law = site
@@ -310,6 +356,11 @@ impl PlayableSitePlan {
             transform.apply(GridPos::new(-6, 6, 0)),
             transform.apply(GridPos::new(6, 6, 0)),
         ];
+        let merchant_anchor = if merchant.id == contact.id {
+            contact_anchor
+        } else {
+            transform.apply(GridPos::new(-27, -11, 0))
+        };
 
         let mut locations = vec![
             PlannedLocation {
@@ -331,6 +382,12 @@ impl PlayableSitePlan {
                 source: LocationSource::Dungeon(crisis_event),
             },
         ];
+        locations.push(PlannedLocation {
+            name: trading_house_name(world, merchant.id),
+            kind: LandmarkKind::Shop,
+            position: merchant_anchor,
+            source: LocationSource::ResidentWorkplace(merchant.id),
+        });
         locations.extend(world.factions().values().zip(faction_anchors).map(
             |(faction, position)| PlannedLocation {
                 name: faction.name.clone(),
@@ -402,6 +459,8 @@ impl PlayableSitePlan {
             transform,
         );
         let aid = plan_aid_situation(world, site_id, crisis_event, &residents)?;
+        let shop = plan_shop(world, site_id, merchant.id, &residents)?;
+        let containers = plan_containers(world, site_id, merchant.id, merchant_anchor);
         let regional_map = MapId(0x8000_0000 ^ map.0);
         let (regional_sites, regional_routes) = plan_region(world);
         let regional_history_sites = plan_regional_history_sites(world, &regional_routes);
@@ -423,6 +482,8 @@ impl PlayableSitePlan {
             evidence_description: evidence.description.clone(),
             encounter,
             aid,
+            shop,
+            containers,
             dungeon,
             living_projects,
             regional_sites,
@@ -538,6 +599,15 @@ impl PlayableSitePlan {
                 facing: Direction::West,
             })
         });
+        let containers = self.containers.iter().map(|planned| Entity {
+            id: planned.container.entity,
+            kind: EntityKind::Item,
+            position: WorldPosition {
+                map: self.map,
+                grid: planned.position,
+            },
+            facing: Direction::South,
+        });
         let landmarks = self
             .locations
             .iter()
@@ -566,7 +636,8 @@ impl PlayableSitePlan {
             std::iter::once(player)
                 .chain(residents)
                 .chain(std::iter::once(encounter))
-                .chain(dungeon_enemies),
+                .chain(dungeon_enemies)
+                .chain(containers),
             landmarks,
             PLAYER_ENTITY,
         )
@@ -639,12 +710,36 @@ impl PlayableSitePlan {
                 experience_reward: 35,
             })
             .map_err(SitePlanError::InvalidGameplay)?;
+        for planned in &self.containers {
+            simulation
+                .add_container(planned.container.clone())
+                .map_err(SitePlanError::InvalidGameplay)?;
+            for item in &planned.contents {
+                simulation
+                    .give_item_with_owner(
+                        planned.container.entity,
+                        planned.container.owner,
+                        item.clone(),
+                    )
+                    .map_err(SitePlanError::InvalidGameplay)?;
+            }
+            if let Some(key) = &planned.key {
+                simulation
+                    .give_item(planned.container.owner, key.clone())
+                    .map_err(SitePlanError::InvalidGameplay)?;
+            }
+        }
         simulation
             .give_item(self.contact_resident().entity, self.starter_sword.clone())
             .map_err(SitePlanError::InvalidGameplay)?;
         simulation
             .give_item(self.aid.custodian_entity, self.aid.medicine.clone())
             .map_err(SitePlanError::InvalidGameplay)?;
+        for item in &self.shop.stock {
+            simulation
+                .give_item(self.shop.merchant_entity, item.clone())
+                .map_err(SitePlanError::InvalidGameplay)?;
+        }
         for item in starter_items() {
             simulation
                 .give_item(PLAYER_ENTITY, item)
@@ -1068,14 +1163,13 @@ impl PlayableSitePlan {
             (-3, -3, 3, 3),
             TerrainCell::new(TerrainKind::StoneFloor),
         );
-        for bounds in [(-31, -16, -23, -7), (-31, 8, -23, 17)] {
-            paint_rect(
-                &mut map,
-                self.transform,
-                bounds,
-                TerrainCell::new(TerrainKind::Farmland),
-            );
-        }
+        paint_building(&mut map, self.transform, (-31, -16, -23, -7), (-27, -7));
+        paint_rect(
+            &mut map,
+            self.transform,
+            (-31, 8, -23, 17),
+            TerrainCell::new(TerrainKind::Farmland),
+        );
         paint_building(&mut map, self.transform, (-16, 3, -11, 8), (-13, 3));
         match self.evidence_location().kind {
             LandmarkKind::Farm => {
@@ -1776,6 +1870,173 @@ fn plan_aid_situation(
     })
 }
 
+fn plan_shop(
+    world: &HistoricalWorld,
+    site: SiteId,
+    merchant: PersonId,
+    residents: &[PlannedResident],
+) -> Result<PlannedShop, SitePlanError> {
+    let resident = residents
+        .iter()
+        .find(|resident| resident.person == merchant)
+        .ok_or(SitePlanError::MissingMerchant)?;
+    let site_state = &world.sites()[&site];
+    let iron = site_state
+        .resources
+        .get(&ResourceKind::Iron)
+        .copied()
+        .unwrap_or_default()
+        .max(0);
+    let medicine = site_state
+        .resources
+        .get(&ResourceKind::Medicine)
+        .copied()
+        .unwrap_or_default()
+        .max(0);
+    let arrow_quantity = (iron / 4).clamp(4, 16) as u16;
+    let dressing_quantity = (medicine / 8).clamp(1, 4) as u16;
+    let reagent = world
+        .rules()
+        .formula(FormulaId(1))
+        .and_then(|formula| formula.reagents.first())
+        .copied()
+        .unwrap_or(MaterialKind::Ashroot);
+    let surname = &world.families()[&world.people()[&merchant].family].surname;
+    let quality_variation = (world.campaign_seed ^ merchant.0) as u8 % 13;
+    let stock = vec![
+        Item {
+            id: SHOP_SWORD,
+            name: format!("{surname} Iron Shortsword"),
+            kind: ItemKind::MeleeWeapon { damage: 3 },
+            quantity: 1,
+            weight_grams: 1_100,
+            quality: 42 + quality_variation,
+        },
+        Item {
+            id: SHOP_ARROWS,
+            name: format!("{} Fletched Arrows", world.sites()[&site].name),
+            kind: ItemKind::Ammunition {
+                kind: AmmunitionKind::Arrow,
+            },
+            quantity: arrow_quantity,
+            weight_grams: u32::from(arrow_quantity) * 45,
+            quality: 38 + quality_variation / 2,
+        },
+        Item {
+            id: SHOP_DRESSING,
+            name: format!("{surname} Herbal Dressings"),
+            kind: ItemKind::Consumable { healing: 4 },
+            quantity: dressing_quantity,
+            weight_grams: u32::from(dressing_quantity) * 80,
+            quality: 45 + quality_variation / 2,
+        },
+        Item {
+            id: SHOP_REAGENT,
+            name: format!("{} Packet", title_case_material(reagent)),
+            kind: ItemKind::Reagent { material: reagent },
+            quantity: 2,
+            weight_grams: reagent_weight(reagent) * 2,
+            quality: 48 + quality_variation / 2,
+        },
+    ];
+    Ok(PlannedShop {
+        merchant,
+        merchant_entity: resident.entity,
+        merchant_name: resident.name.clone(),
+        name: trading_house_name(world, merchant),
+        stock,
+    })
+}
+
+fn plan_containers(
+    world: &HistoricalWorld,
+    site: SiteId,
+    proprietor: PersonId,
+    shop_anchor: GridPos,
+) -> Vec<PlannedContainer> {
+    let owner = EntityId(proprietor.0 + 1);
+    let family = world.people()[&proprietor].family;
+    let surname = &world.families()[&family].surname;
+    let food_reserve = world.sites()[&site]
+        .resources
+        .get(&ResourceKind::Food)
+        .copied()
+        .unwrap_or_default()
+        .max(0);
+    let bread_quantity = (food_reserve / 20).clamp(2, 6) as u16;
+    let water_quantity = (food_reserve / 30).clamp(2, 5) as u16;
+    let lock_code = world.campaign_seed ^ proprietor.0.rotate_left(17) ^ 0x4c45_4447_4552;
+    vec![
+        PlannedContainer {
+            container: Container {
+                entity: PROVISION_CRATE_ENTITY,
+                name: format!("{surname} Provision Crate"),
+                owner,
+                capacity_grams: 18_000,
+                lock_code: None,
+                locked: false,
+            },
+            position: shop_anchor.offset(0, 1, 0),
+            contents: vec![
+                Item {
+                    id: PANTRY_BREAD,
+                    name: format!("{} Brown Loaves", world.sites()[&site].name),
+                    kind: ItemKind::Food { nourishment: 18 },
+                    quantity: bread_quantity,
+                    weight_grams: u32::from(bread_quantity) * 350,
+                    quality: 42,
+                },
+                Item {
+                    id: PANTRY_WATER,
+                    name: "Stoppered Water Flasks".to_string(),
+                    kind: ItemKind::Drink { hydration: 24 },
+                    quantity: water_quantity,
+                    weight_grams: u32::from(water_quantity) * 650,
+                    quality: 45,
+                },
+                Item {
+                    id: PANTRY_TOOL,
+                    name: format!("{surname} Balance Scale"),
+                    kind: ItemKind::Tool,
+                    quantity: 1,
+                    weight_grams: 1_400,
+                    quality: 53,
+                },
+            ],
+            key: None,
+        },
+        PlannedContainer {
+            container: Container {
+                entity: LEDGER_CHEST_ENTITY,
+                name: format!("{surname} Ledger Chest"),
+                owner,
+                capacity_grams: 6_000,
+                lock_code: Some(lock_code),
+                locked: true,
+            },
+            position: shop_anchor.offset(1, 1, 0),
+            contents: vec![Item {
+                id: SHOP_LEDGER,
+                name: format!("{} Supply Ledger", world.sites()[&site].name),
+                kind: ItemKind::Book {
+                    subject: BookSubject::Trade,
+                },
+                quantity: 1,
+                weight_grams: 700,
+                quality: 61,
+            }],
+            key: Some(Item {
+                id: LEDGER_KEY,
+                name: format!("{surname} Ledger Key"),
+                kind: ItemKind::Key { lock_code },
+                quantity: 1,
+                weight_grams: 60,
+                quality: 55,
+            }),
+        },
+    ]
+}
+
 fn drive_value(world: &HistoricalWorld, person: PersonId, drive: Drive) -> u16 {
     u16::from(
         world.people()[&person]
@@ -1812,6 +2073,14 @@ fn plan_residents(
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
+    let workplaces = locations
+        .iter()
+        .filter_map(|location| match location.source {
+            LocationSource::ContactWorkplace(person)
+            | LocationSource::ResidentWorkplace(person) => Some((person, location.position)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut selected = Vec::new();
     let mut seen = BTreeSet::new();
     for person in std::iter::once(contact)
@@ -1819,6 +2088,13 @@ fn plan_residents(
             world
                 .living_people()
                 .filter(|person| person.home == site && person.occupation == Occupation::Healer)
+                .map(|person| person.id),
+        )
+        .chain(workplaces.keys().copied())
+        .chain(
+            world
+                .living_people()
+                .filter(|person| person.home == site && person.occupation == Occupation::Merchant)
                 .map(|person| person.id),
         )
         .chain(world.factions().values().map(|faction| faction.leader))
@@ -1871,21 +2147,23 @@ fn plan_residents(
         .enumerate()
         .map(|(index, person_id)| {
             let person = &world.people()[&person_id];
-            let preferred = if person_id == contact {
-                contact_anchor
-            } else {
-                faction_seats
-                    .get(&person.faction)
-                    .copied()
-                    .filter(|_| world.factions()[&person.faction].leader == person_id)
-                    .unwrap_or_else(|| {
-                        transform.apply(GridPos::new(
-                            fallback_positions[index % fallback_positions.len()].0,
-                            fallback_positions[index % fallback_positions.len()].1,
-                            0,
-                        ))
-                    })
-            };
+            let preferred = workplaces.get(&person_id).copied().unwrap_or_else(|| {
+                if person_id == contact {
+                    contact_anchor
+                } else {
+                    faction_seats
+                        .get(&person.faction)
+                        .copied()
+                        .filter(|_| world.factions()[&person.faction].leader == person_id)
+                        .unwrap_or_else(|| {
+                            transform.apply(GridPos::new(
+                                fallback_positions[index % fallback_positions.len()].0,
+                                fallback_positions[index % fallback_positions.len()].1,
+                                0,
+                            ))
+                        })
+                }
+            });
             let position = first_free_position(preferred, &mut occupied);
             let home_position = first_free_position(
                 transform.apply(GridPos::new(
@@ -2021,6 +2299,11 @@ fn workplace_name(world: &HistoricalWorld, person: PersonId, town: &str) -> Stri
         Occupation::Official => format!("{town} Records Office"),
         Occupation::Laborer => format!("{surname} House"),
     }
+}
+
+fn trading_house_name(world: &HistoricalWorld, person: PersonId) -> String {
+    let family = world.people()[&person].family;
+    format!("{} Trading House", world.families()[&family].surname)
 }
 
 fn workplace_kind(occupation: Occupation) -> LandmarkKind {
@@ -2206,6 +2489,80 @@ mod tests {
                     .is_none_or(|inventory| !inventory.items.contains(&plan.aid.medicine.id)),
                 "seed {seed}"
             );
+        }
+    }
+
+    #[test]
+    fn every_seed_materializes_a_proprietor_shop_and_owned_stock() {
+        for seed in 0..64 {
+            let plan = plan(seed);
+            assert_eq!(plan.shop.stock.len(), 4, "seed {seed}");
+            assert!(plan.residents.iter().any(|resident| {
+                resident.person == plan.shop.merchant
+                    && resident.entity == plan.shop.merchant_entity
+            }));
+            assert!(plan.locations.iter().any(|location| {
+                location.kind == LandmarkKind::Shop
+                    && matches!(
+                        location.source,
+                        LocationSource::ContactWorkplace(person)
+                            | LocationSource::ResidentWorkplace(person)
+                            if person == plan.shop.merchant
+                    )
+            }));
+            let simulation = plan.build_simulation().expect("simulation");
+            for item in &plan.shop.stock {
+                assert_eq!(
+                    simulation.legal_owner(item.id),
+                    Some(plan.shop.merchant_entity),
+                    "seed {seed}"
+                );
+                assert!(
+                    simulation
+                        .inventory(plan.shop.merchant_entity)
+                        .is_some_and(|inventory| inventory.items.contains(&item.id)),
+                    "seed {seed}"
+                );
+            }
+            assert_eq!(plan.containers.len(), 2, "seed {seed}");
+            assert!(
+                plan.containers
+                    .iter()
+                    .any(|container| !container.container.locked)
+            );
+            assert!(
+                plan.containers
+                    .iter()
+                    .any(|container| container.container.locked)
+            );
+            for planned in &plan.containers {
+                assert_eq!(
+                    simulation.container(planned.container.entity),
+                    Some(&planned.container),
+                    "seed {seed}"
+                );
+                for item in &planned.contents {
+                    assert_eq!(
+                        simulation.legal_owner(item.id),
+                        Some(planned.container.owner),
+                        "seed {seed}"
+                    );
+                    assert!(
+                        simulation
+                            .inventory(planned.container.entity)
+                            .is_some_and(|inventory| inventory.items.contains(&item.id)),
+                        "seed {seed}"
+                    );
+                }
+                if let Some(key) = &planned.key {
+                    assert!(
+                        simulation
+                            .inventory(planned.container.owner)
+                            .is_some_and(|inventory| inventory.items.contains(&key.id)),
+                        "seed {seed}"
+                    );
+                }
+            }
         }
     }
 

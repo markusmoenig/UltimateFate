@@ -229,6 +229,14 @@ pub enum AmmunitionKind {
     Arrow,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BookSubject {
+    LocalHistory,
+    Law,
+    Trade,
+    NaturalLore,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ItemKind {
     MeleeWeapon {
@@ -245,6 +253,19 @@ pub enum ItemKind {
     Consumable {
         healing: i16,
     },
+    Food {
+        nourishment: u8,
+    },
+    Drink {
+        hydration: u8,
+    },
+    Book {
+        subject: BookSubject,
+    },
+    Key {
+        lock_code: u64,
+    },
+    Tool,
     Reagent {
         material: MaterialKind,
     },
@@ -282,6 +303,22 @@ impl Inventory {
             equipped_ranged: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Container {
+    pub entity: EntityId,
+    pub name: String,
+    pub owner: EntityId,
+    pub capacity_grams: u32,
+    pub lock_code: Option<u64>,
+    pub locked: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlayerNeeds {
+    pub hunger: u8,
+    pub thirst: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -426,10 +463,42 @@ pub enum GameCommand {
         item: ItemId,
         to: EntityId,
     },
+    GiveQuantity {
+        item: ItemId,
+        to: EntityId,
+        quantity: u16,
+    },
     Take {
         item: ItemId,
         from: EntityId,
     },
+    TakeQuantity {
+        item: ItemId,
+        from: EntityId,
+        quantity: u16,
+    },
+    OpenContainer(EntityId),
+    UnlockContainer {
+        container: EntityId,
+        key: ItemId,
+    },
+    Place {
+        item: ItemId,
+        container: EntityId,
+    },
+    PlaceQuantity {
+        item: ItemId,
+        container: EntityId,
+        quantity: u16,
+    },
+    Drop(ItemId),
+    DropQuantity {
+        item: ItemId,
+        quantity: u16,
+    },
+    Read(ItemId),
+    Eat(ItemId),
+    Drink(ItemId),
     Experiment {
         first: ItemId,
         second: ItemId,
@@ -468,6 +537,12 @@ pub enum ActionFailure {
     NoTransition,
     QuestNotReady,
     ExperimentFailed,
+    ContainerLocked,
+    WrongKey,
+    ContainerFull,
+    NotAContainer,
+    AlreadySatisfied,
+    InvalidQuantity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -492,10 +567,38 @@ pub enum SimulationEvent {
         from: EntityId,
         to: EntityId,
     },
+    ItemQuantityTransferred {
+        source: ItemId,
+        item: ItemId,
+        quantity: u16,
+        from: EntityId,
+        to: EntityId,
+    },
     ItemConsumed {
         owner: EntityId,
         item: ItemId,
         remaining: u16,
+    },
+    ContainerOpened {
+        container: EntityId,
+    },
+    ContainerUnlocked {
+        container: EntityId,
+        key: ItemId,
+    },
+    ItemDropped {
+        item: ItemId,
+        holder: EntityId,
+        position: WorldPosition,
+    },
+    ItemRead {
+        item: ItemId,
+        subject: BookSubject,
+        newly_learned: bool,
+    },
+    NeedsChanged {
+        hunger: u8,
+        thirst: u8,
     },
     FormulaLearned {
         formula: FormulaId,
@@ -599,6 +702,7 @@ pub struct Simulation {
     legal_owners: BTreeMap<ItemId, EntityId>,
     stolen_items: BTreeSet<ItemId>,
     inventories: BTreeMap<EntityId, Inventory>,
+    containers: BTreeMap<EntityId, Container>,
     combatants: BTreeMap<EntityId, Combatant>,
     transitions: BTreeMap<WorldPosition, Transition>,
     quests: BTreeMap<QuestId, Quest>,
@@ -606,6 +710,10 @@ pub struct Simulation {
     progression: CharacterProgression,
     rules: WorldRules,
     known_formulas: BTreeSet<FormulaId>,
+    read_items: BTreeSet<ItemId>,
+    player_needs: PlayerNeeds,
+    next_loose_item_entity: u64,
+    next_split_item_id: u64,
     visited_maps: BTreeSet<MapId>,
     player: EntityId,
 }
@@ -628,7 +736,10 @@ pub enum GameplayBuildError {
     LandmarkOnMissingMap,
     DuplicateItem(ItemId),
     MissingItem(ItemId),
+    InvalidQuantity { item: ItemId, quantity: u16 },
     ItemNotCarried { item: ItemId, owner: EntityId },
+    InvalidContainer(EntityId),
+    ContainerFull(EntityId),
     InvalidCombatant(EntityId),
     InvalidTransition(WorldPosition),
     DuplicateTransition(WorldPosition),
@@ -696,6 +807,7 @@ impl Simulation {
             legal_owners: BTreeMap::new(),
             stolen_items: BTreeSet::new(),
             inventories: BTreeMap::new(),
+            containers: BTreeMap::new(),
             combatants: BTreeMap::new(),
             transitions: BTreeMap::new(),
             quests: BTreeMap::new(),
@@ -703,6 +815,13 @@ impl Simulation {
             progression: CharacterProgression::default(),
             rules,
             known_formulas: BTreeSet::new(),
+            read_items: BTreeSet::new(),
+            player_needs: PlayerNeeds {
+                hunger: 20,
+                thirst: 15,
+            },
+            next_loose_item_entity: 0xd000_0000_0000_0000,
+            next_split_item_id: 0xe000_0000_0000_0000,
             visited_maps: BTreeSet::from([map_id]),
             player,
         })
@@ -838,6 +957,7 @@ impl Simulation {
             legal_owners: BTreeMap::new(),
             stolen_items: BTreeSet::new(),
             inventories: BTreeMap::new(),
+            containers: BTreeMap::new(),
             combatants: BTreeMap::new(),
             transitions: BTreeMap::new(),
             quests: BTreeMap::new(),
@@ -845,6 +965,13 @@ impl Simulation {
             progression: CharacterProgression::default(),
             rules: WorldRules::generate(campaign_seed),
             known_formulas: BTreeSet::new(),
+            read_items: BTreeSet::new(),
+            player_needs: PlayerNeeds {
+                hunger: 20,
+                thirst: 15,
+            },
+            next_loose_item_entity: 0xd000_0000_0000_0000,
+            next_split_item_id: 0xe000_0000_0000_0000,
             visited_maps: BTreeSet::from([map_id]),
             player,
         }
@@ -927,6 +1054,7 @@ impl Simulation {
         }
         self.healers.remove(&entity);
         self.combatants.remove(&entity);
+        self.containers.remove(&entity);
         self.inventories.remove(&entity);
         true
     }
@@ -1015,6 +1143,10 @@ impl Simulation {
         self.items.get(&id)
     }
 
+    pub fn items(&self) -> impl Iterator<Item = &Item> {
+        self.items.values()
+    }
+
     pub fn legal_owner(&self, item: ItemId) -> Option<EntityId> {
         self.legal_owners.get(&item).copied()
     }
@@ -1047,6 +1179,49 @@ impl Simulation {
 
     pub fn player_inventory(&self) -> Option<&Inventory> {
         self.inventory(self.player)
+    }
+
+    pub fn containers(&self) -> impl Iterator<Item = &Container> {
+        self.containers.values()
+    }
+
+    pub fn container(&self, entity: EntityId) -> Option<&Container> {
+        self.containers.get(&entity)
+    }
+
+    pub fn player_needs(&self) -> PlayerNeeds {
+        self.player_needs
+    }
+
+    pub fn container_weight(&self, entity: EntityId) -> Option<u32> {
+        let inventory = self.inventory(entity);
+        self.container(entity)?;
+        Some(
+            inventory
+                .into_iter()
+                .flat_map(|inventory| inventory.items.iter())
+                .filter_map(|item| self.item(*item))
+                .fold(0_u32, |total, item| total.saturating_add(item.weight_grams)),
+        )
+    }
+
+    pub fn add_container(&mut self, container: Container) -> Result<(), GameplayBuildError> {
+        let Some(entity) = self.entities.get(&container.entity) else {
+            return Err(GameplayBuildError::MissingEntity(container.entity));
+        };
+        if entity.kind != EntityKind::Item
+            || container.capacity_grams == 0
+            || (container.locked && container.lock_code.is_none())
+            || !self.entities.contains_key(&container.owner)
+            || self.containers.contains_key(&container.entity)
+        {
+            return Err(GameplayBuildError::InvalidContainer(container.entity));
+        }
+        self.inventories
+            .entry(container.entity)
+            .or_insert_with(|| Inventory::new(container.entity));
+        self.containers.insert(container.entity, container);
+        Ok(())
     }
 
     pub fn combatant(&self, entity: EntityId) -> Option<&Combatant> {
@@ -1121,18 +1296,36 @@ impl Simulation {
     }
 
     pub fn give_item(&mut self, owner: EntityId, item: Item) -> Result<(), GameplayBuildError> {
-        if !self.entities.contains_key(&owner) {
-            return Err(GameplayBuildError::MissingEntity(owner));
+        self.give_item_with_owner(owner, owner, item)
+    }
+
+    pub fn give_item_with_owner(
+        &mut self,
+        custodian: EntityId,
+        legal_owner: EntityId,
+        item: Item,
+    ) -> Result<(), GameplayBuildError> {
+        if !self.entities.contains_key(&custodian) {
+            return Err(GameplayBuildError::MissingEntity(custodian));
+        }
+        if !self.entities.contains_key(&legal_owner) {
+            return Err(GameplayBuildError::MissingEntity(legal_owner));
         }
         if self.items.contains_key(&item.id) {
             return Err(GameplayBuildError::DuplicateItem(item.id));
         }
+        if let Some(container) = self.container(custodian) {
+            let current = self.container_weight(custodian).unwrap_or_default();
+            if current.saturating_add(item.weight_grams) > container.capacity_grams {
+                return Err(GameplayBuildError::InvalidContainer(custodian));
+            }
+        }
         let item_id = item.id;
         self.items.insert(item_id, item);
-        self.legal_owners.insert(item_id, owner);
+        self.legal_owners.insert(item_id, legal_owner);
         self.inventories
-            .entry(owner)
-            .or_insert_with(|| Inventory::new(owner))
+            .entry(custodian)
+            .or_insert_with(|| Inventory::new(custodian))
             .items
             .insert(item_id);
         Ok(())
@@ -1149,6 +1342,12 @@ impl Simulation {
         }
         if !self.items.contains_key(&item) {
             return Err(GameplayBuildError::MissingItem(item));
+        }
+        if let Some(container) = self.container(to) {
+            let current = self.container_weight(to).unwrap_or_default();
+            if current.saturating_add(self.items[&item].weight_grams) > container.capacity_grams {
+                return Err(GameplayBuildError::ContainerFull(to));
+            }
         }
         let from_inventory = self
             .inventories
@@ -1169,6 +1368,167 @@ impl Simulation {
             .items
             .insert(item);
         Ok(SimulationEvent::ItemTransferred { item, from, to })
+    }
+
+    /// Transfers part of a divisible stack while preserving the source stack's
+    /// legal title and stolen status. A partial transfer receives a deterministic
+    /// item identity so command replay reconstructs exactly the same inventories.
+    pub fn transfer_item_quantity(
+        &mut self,
+        item: ItemId,
+        from: EntityId,
+        to: EntityId,
+        quantity: u16,
+    ) -> Result<SimulationEvent, GameplayBuildError> {
+        if !self.entities.contains_key(&to) {
+            return Err(GameplayBuildError::MissingEntity(to));
+        }
+        let Some(source) = self.items.get(&item).cloned() else {
+            return Err(GameplayBuildError::MissingItem(item));
+        };
+        if quantity == 0 || quantity > source.quantity {
+            return Err(GameplayBuildError::InvalidQuantity { item, quantity });
+        }
+        if !self
+            .inventories
+            .get(&from)
+            .is_some_and(|inventory| inventory.items.contains(&item))
+        {
+            return Err(GameplayBuildError::ItemNotCarried { item, owner: from });
+        }
+        let moved_weight = stack_weight_for_quantity(&source, quantity);
+        if let Some(container) = self.container(to) {
+            let current = self.container_weight(to).unwrap_or_default();
+            if current.saturating_add(moved_weight) > container.capacity_grams {
+                return Err(GameplayBuildError::ContainerFull(to));
+            }
+        }
+
+        let moved_item = if quantity == source.quantity {
+            self.inventories
+                .get_mut(&from)
+                .expect("source inventory checked above")
+                .items
+                .remove(&item);
+            let from_inventory = self
+                .inventories
+                .get_mut(&from)
+                .expect("source inventory checked above");
+            if from_inventory.equipped_melee == Some(item) {
+                from_inventory.equipped_melee = None;
+            }
+            if from_inventory.equipped_ranged == Some(item) {
+                from_inventory.equipped_ranged = None;
+            }
+            item
+        } else {
+            let moved_item = self.allocate_split_item_id();
+            let mut split = source;
+            split.id = moved_item;
+            split.quantity = quantity;
+            split.weight_grams = moved_weight;
+            let source = self
+                .items
+                .get_mut(&item)
+                .expect("source item checked above");
+            source.quantity -= quantity;
+            source.weight_grams = source.weight_grams.saturating_sub(moved_weight);
+            self.items.insert(moved_item, split);
+            if let Some(owner) = self.legal_owner(item) {
+                self.legal_owners.insert(moved_item, owner);
+            }
+            if self.is_stolen(item) {
+                self.stolen_items.insert(moved_item);
+            }
+            moved_item
+        };
+        self.inventories
+            .entry(to)
+            .or_insert_with(|| Inventory::new(to))
+            .items
+            .insert(moved_item);
+        Ok(SimulationEvent::ItemQuantityTransferred {
+            source: item,
+            item: moved_item,
+            quantity,
+            from,
+            to,
+        })
+    }
+
+    /// Coalesces a compatible divisible stack already held by `custodian`.
+    /// The lowest item identity survives, keeping repeated transfers stable and
+    /// preventing inventories from filling with one-unit fragments.
+    pub fn merge_compatible_stack(&mut self, custodian: EntityId, item: ItemId) -> ItemId {
+        let Some(item_state) = self.items.get(&item).cloned() else {
+            return item;
+        };
+        if !item_kind_is_stackable(item_state.kind)
+            || !self
+                .inventory(custodian)
+                .is_some_and(|inventory| inventory.items.contains(&item))
+        {
+            return item;
+        }
+        let legal_owner = self.legal_owner(item);
+        let stolen = self.is_stolen(item);
+        let compatible = self
+            .inventory(custodian)
+            .into_iter()
+            .flat_map(|inventory| inventory.items.iter().copied())
+            .filter(|candidate| *candidate != item)
+            .filter(|candidate| {
+                self.items.get(candidate).is_some_and(|candidate_state| {
+                    item_kind_is_stackable(candidate_state.kind)
+                        && candidate_state.name == item_state.name
+                        && candidate_state.kind == item_state.kind
+                        && candidate_state.quality == item_state.quality
+                        && self.legal_owner(*candidate) == legal_owner
+                        && self.is_stolen(*candidate) == stolen
+                })
+            })
+            .min();
+        let Some(other) = compatible else {
+            return item;
+        };
+        let (survivor, consumed) = if item < other {
+            (item, other)
+        } else {
+            (other, item)
+        };
+        let consumed_state = self
+            .items
+            .remove(&consumed)
+            .expect("compatible stack exists");
+        let survivor_state = self
+            .items
+            .get_mut(&survivor)
+            .expect("compatible survivor exists");
+        survivor_state.quantity = survivor_state
+            .quantity
+            .saturating_add(consumed_state.quantity);
+        survivor_state.weight_grams = survivor_state
+            .weight_grams
+            .saturating_add(consumed_state.weight_grams);
+        self.inventories
+            .get_mut(&custodian)
+            .expect("custodian inventory checked above")
+            .items
+            .remove(&consumed);
+        self.legal_owners.remove(&consumed);
+        self.stolen_items.remove(&consumed);
+        self.read_items.remove(&consumed);
+        survivor
+    }
+
+    fn allocate_split_item_id(&mut self) -> ItemId {
+        loop {
+            let candidate = ItemId(self.next_split_item_id);
+            self.next_split_item_id = self.next_split_item_id.saturating_add(1);
+            if !self.items.contains_key(&candidate) {
+                return candidate;
+            }
+        }
     }
 
     pub fn hostile_in_melee_range(&self) -> Option<EntityId> {
@@ -1247,7 +1607,18 @@ impl Simulation {
                     | GameCommand::UseItem(_)
                     | GameCommand::Study(_)
                     | GameCommand::Give { .. }
+                    | GameCommand::GiveQuantity { .. }
                     | GameCommand::Take { .. }
+                    | GameCommand::TakeQuantity { .. }
+                    | GameCommand::OpenContainer(_)
+                    | GameCommand::UnlockContainer { .. }
+                    | GameCommand::Place { .. }
+                    | GameCommand::PlaceQuantity { .. }
+                    | GameCommand::Drop(_)
+                    | GameCommand::DropQuantity { .. }
+                    | GameCommand::Read(_)
+                    | GameCommand::Eat(_)
+                    | GameCommand::Drink(_)
                     | GameCommand::Experiment { .. }
             )
         {
@@ -1261,8 +1632,37 @@ impl Simulation {
             GameCommand::Equip(item) => self.resolve_equip(self.player, item),
             GameCommand::UseItem(item) => self.resolve_use_item(self.player, item),
             GameCommand::Study(item) => self.resolve_study(item),
-            GameCommand::Give { item, to } => self.resolve_give(item, to),
-            GameCommand::Take { item, from } => self.resolve_take(item, from),
+            GameCommand::Give { item, to } => {
+                self.resolve_give(item, to, self.stack_quantity(item))
+            }
+            GameCommand::GiveQuantity { item, to, quantity } => {
+                self.resolve_give(item, to, quantity)
+            }
+            GameCommand::Take { item, from } => {
+                self.resolve_take(item, from, self.stack_quantity(item))
+            }
+            GameCommand::TakeQuantity {
+                item,
+                from,
+                quantity,
+            } => self.resolve_take(item, from, quantity),
+            GameCommand::OpenContainer(container) => self.resolve_open_container(container),
+            GameCommand::UnlockContainer { container, key } => {
+                self.resolve_unlock_container(container, key)
+            }
+            GameCommand::Place { item, container } => {
+                self.resolve_place(item, container, self.stack_quantity(item))
+            }
+            GameCommand::PlaceQuantity {
+                item,
+                container,
+                quantity,
+            } => self.resolve_place(item, container, quantity),
+            GameCommand::Drop(item) => self.resolve_drop(item, self.stack_quantity(item)),
+            GameCommand::DropQuantity { item, quantity } => self.resolve_drop(item, quantity),
+            GameCommand::Read(item) => self.resolve_read(item),
+            GameCommand::Eat(item) => self.resolve_eat(item),
+            GameCommand::Drink(item) => self.resolve_drink(item),
             GameCommand::Experiment { first, second } => self.resolve_experiment(first, second),
             GameCommand::Cast { formula, target } => self.resolve_cast(formula, target),
             GameCommand::Traverse => self.resolve_traverse(),
@@ -1278,6 +1678,7 @@ impl Simulation {
             GameCommand::Pause => unreachable!("pause handled above"),
         };
         if outcome.advanced_time {
+            self.advance_player_needs(&mut outcome.events);
             outcome.changed_world |= self.advance_hostiles(&mut outcome.events);
             self.revive_player_at_nearest_healer(&mut outcome.events);
         }
@@ -1439,6 +1840,11 @@ impl Simulation {
             ItemKind::RangedWeapon { .. } => inventory.equipped_ranged = Some(item),
             ItemKind::Ammunition { .. }
             | ItemKind::Consumable { .. }
+            | ItemKind::Food { .. }
+            | ItemKind::Drink { .. }
+            | ItemKind::Book { .. }
+            | ItemKind::Key { .. }
+            | ItemKind::Tool
             | ItemKind::Reagent { .. }
             | ItemKind::InscribedArtifact { .. }
             | ItemKind::Artifact => {
@@ -1477,7 +1883,7 @@ impl Simulation {
         combatant.health = (combatant.health + healing).min(combatant.max_health);
         let healed = combatant.health - previous;
         let item = self.items.get_mut(&item).expect("item checked above");
-        item.quantity -= 1;
+        consume_one_unit(item);
         CommandOutcome {
             advanced_time: false,
             changed_world: true,
@@ -1525,23 +1931,73 @@ impl Simulation {
         }
     }
 
-    fn resolve_give(&mut self, item: ItemId, to: EntityId) -> CommandOutcome {
+    fn resolve_give(&mut self, item: ItemId, to: EntityId, quantity: u16) -> CommandOutcome {
         if !self.entities_are_adjacent(self.player, to) {
             return failed(ActionFailure::OutOfRange);
         }
         let player_holds_title =
             self.legal_owner(item) == Some(self.player) && !self.is_stolen(item);
-        let event = match self.transfer_item(item, self.player, to) {
+        let mut event = match self.transfer_item_quantity(item, self.player, to, quantity) {
             Ok(event) => event,
+            Err(GameplayBuildError::InvalidQuantity { .. }) => {
+                return failed(ActionFailure::InvalidQuantity);
+            }
             Err(GameplayBuildError::ItemNotCarried { .. }) => {
                 return failed(ActionFailure::ItemNotCarried);
             }
             Err(_) => return failed(ActionFailure::InvalidTarget),
         };
+        let moved_item = quantity_transfer_item(&event);
         if player_holds_title {
-            self.transfer_legal_ownership(item, self.player, to);
-        } else if self.legal_owner(item) == Some(to) {
-            self.stolen_items.remove(&item);
+            self.transfer_legal_ownership(moved_item, self.player, to);
+        } else if self.legal_owner(moved_item) == Some(to) {
+            self.stolen_items.remove(&moved_item);
+        }
+        let moved_item = self.merge_compatible_stack(to, moved_item);
+        retarget_quantity_event(&mut event, moved_item);
+        self.tick = self.tick.saturating_add(1);
+        CommandOutcome {
+            advanced_time: true,
+            changed_world: true,
+            events: vec![event],
+        }
+    }
+
+    fn resolve_take(&mut self, item: ItemId, from: EntityId, quantity: u16) -> CommandOutcome {
+        if !self.entities_are_adjacent(self.player, from) {
+            return failed(ActionFailure::OutOfRange);
+        }
+        if self
+            .container(from)
+            .is_some_and(|container| container.locked)
+        {
+            return failed(ActionFailure::ContainerLocked);
+        }
+        let mut event = match self.transfer_item_quantity(item, from, self.player, quantity) {
+            Ok(event) => event,
+            Err(GameplayBuildError::InvalidQuantity { .. }) => {
+                return failed(ActionFailure::InvalidQuantity);
+            }
+            Err(GameplayBuildError::ItemNotCarried { .. }) => {
+                return failed(ActionFailure::ItemNotCarried);
+            }
+            Err(_) => return failed(ActionFailure::InvalidTarget),
+        };
+        let moved_item = quantity_transfer_item(&event);
+        if self.legal_owner(moved_item) != Some(self.player) {
+            self.stolen_items.insert(moved_item);
+        }
+        let moved_item = self.merge_compatible_stack(self.player, moved_item);
+        retarget_quantity_event(&mut event, moved_item);
+        let remove_empty_holder = self
+            .entity(from)
+            .is_some_and(|entity| entity.kind == EntityKind::Item)
+            && !self.containers.contains_key(&from)
+            && self
+                .inventory(from)
+                .is_none_or(|inventory| inventory.items.is_empty());
+        if remove_empty_holder {
+            self.remove_entity(from);
         }
         self.tick = self.tick.saturating_add(1);
         CommandOutcome {
@@ -1551,26 +2007,251 @@ impl Simulation {
         }
     }
 
-    fn resolve_take(&mut self, item: ItemId, from: EntityId) -> CommandOutcome {
-        if !self.entities_are_adjacent(self.player, from) {
+    fn resolve_open_container(&self, container: EntityId) -> CommandOutcome {
+        if !self.entities_are_adjacent(self.player, container) {
             return failed(ActionFailure::OutOfRange);
         }
-        let event = match self.transfer_item(item, from, self.player) {
+        let Some(container_state) = self.container(container) else {
+            return failed(ActionFailure::NotAContainer);
+        };
+        if container_state.locked {
+            return failed(ActionFailure::ContainerLocked);
+        }
+        CommandOutcome {
+            advanced_time: false,
+            changed_world: false,
+            events: vec![SimulationEvent::ContainerOpened { container }],
+        }
+    }
+
+    fn resolve_unlock_container(&mut self, container: EntityId, key: ItemId) -> CommandOutcome {
+        if !self.entities_are_adjacent(self.player, container) {
+            return failed(ActionFailure::OutOfRange);
+        }
+        let carried = self
+            .player_inventory()
+            .is_some_and(|inventory| inventory.items.contains(&key));
+        if !carried {
+            return failed(ActionFailure::ItemNotCarried);
+        }
+        let Some(lock_code) = self
+            .container(container)
+            .and_then(|container| container.locked.then_some(container.lock_code).flatten())
+        else {
+            return failed(ActionFailure::NotAContainer);
+        };
+        if self.item(key).map(|item| item.kind) != Some(ItemKind::Key { lock_code }) {
+            return failed(ActionFailure::WrongKey);
+        }
+        self.containers
+            .get_mut(&container)
+            .expect("container lock checked above")
+            .locked = false;
+        self.tick = self.tick.saturating_add(1);
+        CommandOutcome {
+            advanced_time: true,
+            changed_world: true,
+            events: vec![SimulationEvent::ContainerUnlocked { container, key }],
+        }
+    }
+
+    fn resolve_place(
+        &mut self,
+        item: ItemId,
+        container: EntityId,
+        quantity: u16,
+    ) -> CommandOutcome {
+        if !self.entities_are_adjacent(self.player, container) {
+            return failed(ActionFailure::OutOfRange);
+        }
+        let Some(container_state) = self.container(container) else {
+            return failed(ActionFailure::NotAContainer);
+        };
+        if container_state.locked {
+            return failed(ActionFailure::ContainerLocked);
+        }
+        let mut event = match self.transfer_item_quantity(item, self.player, container, quantity) {
             Ok(event) => event,
+            Err(GameplayBuildError::InvalidQuantity { .. }) => {
+                return failed(ActionFailure::InvalidQuantity);
+            }
+            Err(GameplayBuildError::ContainerFull(_)) => {
+                return failed(ActionFailure::ContainerFull);
+            }
             Err(GameplayBuildError::ItemNotCarried { .. }) => {
                 return failed(ActionFailure::ItemNotCarried);
             }
             Err(_) => return failed(ActionFailure::InvalidTarget),
         };
-        if self.legal_owner(item) != Some(self.player) {
-            self.stolen_items.insert(item);
-        }
+        let moved_item = quantity_transfer_item(&event);
+        let moved_item = self.merge_compatible_stack(container, moved_item);
+        retarget_quantity_event(&mut event, moved_item);
         self.tick = self.tick.saturating_add(1);
         CommandOutcome {
             advanced_time: true,
             changed_world: true,
             events: vec![event],
         }
+    }
+
+    fn resolve_drop(&mut self, item: ItemId, quantity: u16) -> CommandOutcome {
+        if !self
+            .player_inventory()
+            .is_some_and(|inventory| inventory.items.contains(&item))
+        {
+            return failed(ActionFailure::ItemNotCarried);
+        }
+        if quantity == 0 || quantity > self.stack_quantity(item) {
+            return failed(ActionFailure::InvalidQuantity);
+        }
+        let holder = loop {
+            let candidate = EntityId(self.next_loose_item_entity);
+            self.next_loose_item_entity = self.next_loose_item_entity.saturating_add(1);
+            if !self.entities.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let position = self.player().position;
+        self.entities.insert(
+            holder,
+            Entity {
+                id: holder,
+                kind: EntityKind::Item,
+                position,
+                facing: Direction::South,
+            },
+        );
+        let event = match self.transfer_item_quantity(item, self.player, holder, quantity) {
+            Ok(event) => event,
+            Err(GameplayBuildError::InvalidQuantity { .. }) => {
+                self.remove_entity(holder);
+                return failed(ActionFailure::InvalidQuantity);
+            }
+            Err(_) => {
+                self.remove_entity(holder);
+                return failed(ActionFailure::InvalidTarget);
+            }
+        };
+        let moved_item = quantity_transfer_item(&event);
+        self.tick = self.tick.saturating_add(1);
+        CommandOutcome {
+            advanced_time: true,
+            changed_world: true,
+            events: vec![
+                event,
+                SimulationEvent::ItemDropped {
+                    item: moved_item,
+                    holder,
+                    position,
+                },
+            ],
+        }
+    }
+
+    fn resolve_read(&mut self, item: ItemId) -> CommandOutcome {
+        if !self
+            .player_inventory()
+            .is_some_and(|inventory| inventory.items.contains(&item))
+        {
+            return failed(ActionFailure::ItemNotCarried);
+        }
+        let Some(ItemKind::Book { subject }) = self.item(item).map(|item| item.kind) else {
+            return failed(ActionFailure::ItemCannotBeUsed);
+        };
+        let newly_learned = self.read_items.insert(item);
+        if newly_learned {
+            self.progression.discoveries = self.progression.discoveries.saturating_add(1);
+        }
+        self.tick = self.tick.saturating_add(1);
+        CommandOutcome {
+            advanced_time: true,
+            changed_world: newly_learned,
+            events: vec![SimulationEvent::ItemRead {
+                item,
+                subject,
+                newly_learned,
+            }],
+        }
+    }
+
+    fn resolve_eat(&mut self, item: ItemId) -> CommandOutcome {
+        let Some(ItemKind::Food { nourishment }) = self.carried_item_kind(item) else {
+            return failed(if self.item(item).is_some() {
+                ActionFailure::ItemCannotBeUsed
+            } else {
+                ActionFailure::ItemNotCarried
+            });
+        };
+        if self.player_needs.hunger == 0 {
+            return failed(ActionFailure::AlreadySatisfied);
+        }
+        self.player_needs.hunger = self.player_needs.hunger.saturating_sub(nourishment);
+        self.consume_carried_item(item)
+    }
+
+    fn resolve_drink(&mut self, item: ItemId) -> CommandOutcome {
+        let Some(ItemKind::Drink { hydration }) = self.carried_item_kind(item) else {
+            return failed(if self.item(item).is_some() {
+                ActionFailure::ItemCannotBeUsed
+            } else {
+                ActionFailure::ItemNotCarried
+            });
+        };
+        if self.player_needs.thirst == 0 {
+            return failed(ActionFailure::AlreadySatisfied);
+        }
+        self.player_needs.thirst = self.player_needs.thirst.saturating_sub(hydration);
+        self.consume_carried_item(item)
+    }
+
+    fn carried_item_kind(&self, item: ItemId) -> Option<ItemKind> {
+        self.player_inventory()
+            .is_some_and(|inventory| inventory.items.contains(&item))
+            .then(|| self.item(item).map(|item| item.kind))
+            .flatten()
+    }
+
+    fn stack_quantity(&self, item: ItemId) -> u16 {
+        self.item(item)
+            .map(|item| item.quantity)
+            .unwrap_or_default()
+    }
+
+    fn consume_carried_item(&mut self, item: ItemId) -> CommandOutcome {
+        let item_state = self.items.get_mut(&item).expect("carried item exists");
+        if item_state.quantity == 0 {
+            return failed(ActionFailure::ItemCannotBeUsed);
+        }
+        consume_one_unit(item_state);
+        let remaining = item_state.quantity;
+        self.tick = self.tick.saturating_add(1);
+        CommandOutcome {
+            advanced_time: true,
+            changed_world: true,
+            events: vec![
+                SimulationEvent::ItemConsumed {
+                    owner: self.player,
+                    item,
+                    remaining,
+                },
+                SimulationEvent::NeedsChanged {
+                    hunger: self.player_needs.hunger,
+                    thirst: self.player_needs.thirst,
+                },
+            ],
+        }
+    }
+
+    fn advance_player_needs(&mut self, events: &mut Vec<SimulationEvent>) {
+        if !self.tick.is_multiple_of(12) {
+            return;
+        }
+        self.player_needs.hunger = self.player_needs.hunger.saturating_add(1).min(100);
+        self.player_needs.thirst = self.player_needs.thirst.saturating_add(2).min(100);
+        events.push(SimulationEvent::NeedsChanged {
+            hunger: self.player_needs.hunger,
+            thirst: self.player_needs.thirst,
+        });
     }
 
     fn entities_are_adjacent(&self, first: EntityId, second: EntityId) -> bool {
@@ -1626,7 +2307,7 @@ impl Simulation {
         let mut events = Vec::new();
         for item in [first, second] {
             let reagent = self.items.get_mut(&item).expect("experiment item checked");
-            reagent.quantity -= 1;
+            consume_one_unit(reagent);
             events.push(SimulationEvent::ItemConsumed {
                 owner: self.player,
                 item,
@@ -1716,7 +2397,7 @@ impl Simulation {
         let mut events = Vec::new();
         for item in reagent_items {
             let reagent = self.items.get_mut(&item).expect("reagent was checked");
-            reagent.quantity -= 1;
+            consume_one_unit(reagent);
             events.push(SimulationEvent::ItemConsumed {
                 owner: self.player,
                 item,
@@ -1850,7 +2531,7 @@ impl Simulation {
             .items
             .get_mut(&ammunition_item)
             .expect("ammunition selected from items");
-        ammunition.quantity -= 1;
+        consume_one_unit(ammunition);
         let remaining = ammunition.quantity;
         let mut events = vec![SimulationEvent::ItemConsumed {
             owner: attacker,
@@ -2006,13 +2687,17 @@ impl Simulation {
                                 if *entity == target && *by == player
                         )
                     }),
-                    QuestObjectiveKind::Recover(target) => source_events.iter().any(|event| {
-                        matches!(
-                            event,
-                            SimulationEvent::ItemTransferred { item, to, .. }
-                                if *item == target && *to == player
-                        )
-                    }),
+                    QuestObjectiveKind::Recover(target) => {
+                        source_events.iter().any(|event| match event {
+                            SimulationEvent::ItemTransferred { item, to, .. } => {
+                                *item == target && *to == player
+                            }
+                            SimulationEvent::ItemQuantityTransferred { source, to, .. } => {
+                                *source == target && *to == player
+                            }
+                            _ => false,
+                        })
+                    }
                 };
                 if completed {
                     objective.completed = true;
@@ -2295,8 +2980,50 @@ fn failed(reason: ActionFailure) -> CommandOutcome {
     }
 }
 
+fn quantity_transfer_item(event: &SimulationEvent) -> ItemId {
+    match event {
+        SimulationEvent::ItemQuantityTransferred { item, .. }
+        | SimulationEvent::ItemTransferred { item, .. } => *item,
+        _ => unreachable!("item transfer helper received a non-transfer event"),
+    }
+}
+
+fn retarget_quantity_event(event: &mut SimulationEvent, final_item: ItemId) {
+    if let SimulationEvent::ItemQuantityTransferred { item, .. } = event {
+        *item = final_item;
+    }
+}
+
 fn grid_distance(first: GridPos, second: GridPos) -> i32 {
     (first.x - second.x).abs() + (first.y - second.y).abs()
+}
+
+fn stack_weight_for_quantity(item: &Item, quantity: u16) -> u32 {
+    if quantity >= item.quantity {
+        item.weight_grams
+    } else {
+        let numerator = u64::from(item.weight_grams) * u64::from(quantity);
+        let denominator = u64::from(item.quantity.max(1));
+        numerator.div_ceil(denominator).min(u64::from(u32::MAX)) as u32
+    }
+}
+
+fn consume_one_unit(item: &mut Item) {
+    debug_assert!(item.quantity > 0);
+    let consumed_weight = stack_weight_for_quantity(item, 1);
+    item.quantity -= 1;
+    item.weight_grams = item.weight_grams.saturating_sub(consumed_weight);
+}
+
+const fn item_kind_is_stackable(kind: ItemKind) -> bool {
+    matches!(
+        kind,
+        ItemKind::Ammunition { .. }
+            | ItemKind::Consumable { .. }
+            | ItemKind::Food { .. }
+            | ItemKind::Drink { .. }
+            | ItemKind::Reagent { .. }
+    )
 }
 
 fn ranged_distance(first: GridPos, second: GridPos) -> i32 {
@@ -3272,6 +3999,127 @@ mod tests {
     }
 
     #[test]
+    fn containers_enforce_locks_capacity_custody_and_ordinary_object_actions() {
+        let mut simulation = Simulation::demo(0xabc);
+        let player = simulation.player_id();
+        let owner = EntityId(2);
+        let container = EntityId(0xcafe);
+        let position = WorldPosition {
+            map: simulation.player().position.map,
+            grid: simulation.player().position.grid.offset(1, 0, 0),
+        };
+        simulation
+            .add_entity(Entity {
+                id: container,
+                kind: EntityKind::Item,
+                position,
+                facing: Direction::South,
+            })
+            .expect("container entity");
+        simulation
+            .add_container(Container {
+                entity: container,
+                name: "Locked Pantry".to_string(),
+                owner,
+                capacity_grams: 1_000,
+                lock_code: Some(77),
+                locked: true,
+            })
+            .expect("container");
+        let food = ItemId(0x501);
+        simulation
+            .give_item_with_owner(
+                container,
+                owner,
+                Item {
+                    id: food,
+                    name: "Brown Bread".to_string(),
+                    kind: ItemKind::Food { nourishment: 12 },
+                    quantity: 2,
+                    weight_grams: 600,
+                    quality: 40,
+                },
+            )
+            .expect("food");
+        let key = ItemId(0x502);
+        simulation
+            .give_item(
+                player,
+                Item {
+                    id: key,
+                    name: "Pantry Key".to_string(),
+                    kind: ItemKind::Key { lock_code: 77 },
+                    quantity: 1,
+                    weight_grams: 40,
+                    quality: 50,
+                },
+            )
+            .expect("key");
+
+        assert_eq!(
+            simulation
+                .apply_command(GameCommand::OpenContainer(container))
+                .events,
+            vec![SimulationEvent::ActionFailed(
+                ActionFailure::ContainerLocked
+            )]
+        );
+        simulation.apply_command(GameCommand::UnlockContainer { container, key });
+        assert!(!simulation.container(container).expect("container").locked);
+        simulation.apply_command(GameCommand::Take {
+            item: food,
+            from: container,
+        });
+        assert_eq!(simulation.legal_owner(food), Some(owner));
+        assert!(simulation.is_stolen(food));
+        let hunger = simulation.player_needs().hunger;
+        simulation.apply_command(GameCommand::Eat(food));
+        assert!(simulation.player_needs().hunger < hunger);
+
+        let book = ItemId(0x503);
+        simulation
+            .give_item(
+                player,
+                Item {
+                    id: book,
+                    name: "Town Record".to_string(),
+                    kind: ItemKind::Book {
+                        subject: BookSubject::LocalHistory,
+                    },
+                    quantity: 1,
+                    weight_grams: 1_100,
+                    quality: 60,
+                },
+            )
+            .expect("book");
+        let reading = simulation.apply_command(GameCommand::Read(book));
+        assert!(reading.events.iter().any(|event| matches!(
+            event,
+            SimulationEvent::ItemRead {
+                item,
+                newly_learned: true,
+                ..
+            } if *item == book
+        )));
+        let full = simulation.apply_command(GameCommand::Place {
+            item: book,
+            container,
+        });
+        assert_eq!(
+            full.events,
+            vec![SimulationEvent::ActionFailed(ActionFailure::ContainerFull)]
+        );
+
+        let drop = simulation.apply_command(GameCommand::Drop(book));
+        let holder = drop.events.iter().find_map(|event| match event {
+            SimulationEvent::ItemDropped { holder, .. } => Some(*holder),
+            _ => None,
+        });
+        assert!(holder.is_some());
+        assert_eq!(simulation.legal_owner(book), Some(player));
+    }
+
+    #[test]
     fn custody_and_legal_ownership_distinguish_gifts_from_theft() {
         let mut simulation = Simulation::demo(44);
         let player = simulation.player_id();
@@ -3374,5 +4222,100 @@ mod tests {
         );
         assert!(!simulation.player_inventory().unwrap().items.contains(&item));
         assert_eq!(simulation.player_id(), player);
+    }
+
+    #[test]
+    fn quantity_transfers_preserve_mass_title_and_merge_compatible_stacks() {
+        let mut simulation = Simulation::demo(46);
+        let player = simulation.player_id();
+        let neighbor = EntityId(2);
+        let player_position = simulation.player().position;
+        assert!(simulation.move_entity(
+            neighbor,
+            WorldPosition {
+                map: player_position.map,
+                grid: player_position.grid.offset(1, 0, 0),
+            },
+        ));
+        let provisions = ItemId(0xcafe);
+        simulation
+            .give_item(
+                player,
+                Item {
+                    id: provisions,
+                    name: "Travel bread".to_string(),
+                    kind: ItemKind::Food { nourishment: 12 },
+                    quantity: 5,
+                    weight_grams: 1_750,
+                    quality: 40,
+                },
+            )
+            .expect("stack");
+
+        let first = simulation.apply_command(GameCommand::GiveQuantity {
+            item: provisions,
+            to: neighbor,
+            quantity: 2,
+        });
+        let first_moved = first
+            .events
+            .iter()
+            .find_map(|event| match event {
+                SimulationEvent::ItemQuantityTransferred { item, quantity, .. }
+                    if *quantity == 2 =>
+                {
+                    Some(*item)
+                }
+                _ => None,
+            })
+            .expect("partial transfer");
+        assert_eq!(simulation.item(provisions).unwrap().quantity, 3);
+        assert_eq!(simulation.item(provisions).unwrap().weight_grams, 1_050);
+        assert_eq!(simulation.item(first_moved).unwrap().quantity, 2);
+        assert_eq!(simulation.item(first_moved).unwrap().weight_grams, 700);
+        assert_eq!(simulation.legal_owner(first_moved), Some(neighbor));
+
+        simulation.apply_command(GameCommand::GiveQuantity {
+            item: provisions,
+            to: neighbor,
+            quantity: 1,
+        });
+        assert_eq!(simulation.item(provisions).unwrap().quantity, 2);
+        assert_eq!(simulation.item(first_moved).unwrap().quantity, 3);
+        assert_eq!(
+            simulation
+                .items()
+                .map(|item| item.weight_grams)
+                .sum::<u32>(),
+            1_750
+        );
+
+        let theft = simulation.apply_command(GameCommand::TakeQuantity {
+            item: first_moved,
+            from: neighbor,
+            quantity: 2,
+        });
+        let stolen = theft
+            .events
+            .iter()
+            .find_map(|event| match event {
+                SimulationEvent::ItemQuantityTransferred { item, .. } => Some(*item),
+                _ => None,
+            })
+            .expect("theft transfer");
+        assert_eq!(simulation.item(first_moved).unwrap().quantity, 1);
+        assert_eq!(simulation.item(stolen).unwrap().quantity, 2);
+        assert_eq!(simulation.legal_owner(stolen), Some(neighbor));
+        assert!(simulation.is_stolen(stolen));
+
+        let before = simulation.clone();
+        let invalid = simulation.apply_command(GameCommand::DropQuantity {
+            item: stolen,
+            quantity: 0,
+        });
+        assert!(invalid.events.contains(&SimulationEvent::ActionFailed(
+            ActionFailure::InvalidQuantity
+        )));
+        assert_eq!(simulation, before);
     }
 }

@@ -24,9 +24,10 @@ use ultimate_fate_lab::bridge::RuntimeBridge;
 use ultimate_fate_lab::{
     ExperienceTracker, LabCommand, LocalObjectiveProgress, error_json as lab_error_json,
     goals_json as lab_goals_json, help_json as lab_help_json,
-    local_objectives_json as lab_local_objectives_json, observation_json as lab_observation_json,
-    open_goal_ids as lab_open_goal_ids, path_to_landmark as lab_path_to_landmark,
-    path_to_position as lab_path_to_position, path_to_unvisited as lab_path_to_unvisited,
+    local_objectives_json as lab_local_objectives_json, objects_json as lab_objects_json,
+    observation_json as lab_observation_json, open_goal_ids as lab_open_goal_ids,
+    path_to_landmark as lab_path_to_landmark, path_to_position as lab_path_to_position,
+    path_to_unvisited as lab_path_to_unvisited, shop_json as lab_shop_json,
     world_json as lab_world_json,
 };
 use ultimate_fate_present::{PresentationSnapshot, ViewportRequest};
@@ -35,7 +36,7 @@ use ultimate_fate_render::{
     WgpuRenderer,
 };
 use ultimate_fate_session::{
-    CampaignCommand, CampaignEvent, CampaignOutcome, CampaignSession, ResidentGoal,
+    CampaignCommand, CampaignEvent, CampaignOutcome, CampaignSession, ResidentGoal, TradeDirection,
 };
 use ultimate_fate_text::{Conversation, ConversationContext, ConversationTopicKind};
 use ultimate_fate_worldgen::{LocationSource, PlayableSitePlan};
@@ -69,6 +70,8 @@ enum UiMode {
     Region,
     Conversation,
     Inventory,
+    Container,
+    Trade,
     Targeting,
     Resolution,
 }
@@ -131,8 +134,22 @@ impl InputPrompts {
 
     fn inventory_help(self) -> String {
         format!(
-            "{} CHOOSE   {} EQUIP / USE   {} / {} CLOSE",
-            self.vertical_navigation, self.primary, self.back, self.menu
+            "{} CHOOSE   A / D AMOUNT   {} EQUIP / USE   {} DROP   {} / {} CLOSE",
+            self.vertical_navigation, self.primary, self.inspect, self.back, self.menu
+        )
+    }
+
+    fn trade_help(self) -> String {
+        format!(
+            "{} CHOOSE   A / D AMOUNT   {} BUY / SELL   {} TRADE   {} CLOSE",
+            self.vertical_navigation, self.inspect, self.primary, self.back
+        )
+    }
+
+    fn container_help(self) -> String {
+        format!(
+            "{} CHOOSE   A / D AMOUNT   {} CONTENTS / PACK   {} MOVE   {} CLOSE",
+            self.vertical_navigation, self.inspect, self.primary, self.back
         )
     }
 
@@ -159,6 +176,26 @@ struct ActiveConversation {
     conversation: Conversation,
     selected: usize,
     response: Option<String>,
+}
+
+struct ActiveTrade {
+    merchant: PersonId,
+    selected: usize,
+    direction: TradeDirection,
+    quantity: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContainerSide {
+    Contents,
+    Pack,
+}
+
+struct ActiveContainer {
+    entity: EntityId,
+    selected: usize,
+    side: ContainerSide,
+    quantity: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,9 +242,12 @@ struct State {
     met_contact: bool,
     inspected_evidence: bool,
     active_conversation: Option<ActiveConversation>,
+    active_trade: Option<ActiveTrade>,
+    active_container: Option<ActiveContainer>,
     learned_topics: BTreeSet<(PersonId, ConversationTopicKind)>,
     questioned_factions: BTreeSet<FactionId>,
     inventory_selected: usize,
+    inventory_quantity: u16,
     targeting: Option<TargetingState>,
     active_resolution: Option<ActiveResolution>,
     regional_goal_selected: usize,
@@ -436,9 +476,12 @@ impl State {
             met_contact: false,
             inspected_evidence: false,
             active_conversation: None,
+            active_trade: None,
+            active_container: None,
             learned_topics: BTreeSet::new(),
             questioned_factions: BTreeSet::new(),
             inventory_selected: 0,
+            inventory_quantity: 1,
             targeting: None,
             active_resolution: None,
             regional_goal_selected: 0,
@@ -542,6 +585,55 @@ impl State {
                     aftermath_complete: self.aftermath_complete,
                 },
             ),
+            LabCommand::Objects => lab_objects_json(&self.campaign),
+            LabCommand::ObjectAction { command, .. } => {
+                let outcome = self.campaign.apply_game_command(command);
+                let failed = outcome
+                    .simulation
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, SimulationEvent::ActionFailed(_)));
+                self.process_simulation_outcome(outcome);
+                if failed {
+                    lab_error_json("object action failed in the live simulation")
+                } else {
+                    lab_objects_json(&self.campaign)
+                }
+            }
+            LabCommand::Shop => lab_shop_json(&self.campaign),
+            LabCommand::Trade {
+                direction,
+                item,
+                quantity,
+                ..
+            } => {
+                let merchant = self.campaign.site_plan().shop.merchant;
+                let outcome = self.campaign.apply_command(quantity.map_or(
+                    CampaignCommand::Trade {
+                        merchant,
+                        item,
+                        direction,
+                    },
+                    |quantity| CampaignCommand::TradeQuantity {
+                        merchant,
+                        item,
+                        direction,
+                        quantity,
+                    },
+                ));
+                let rejected = outcome
+                    .campaign_events
+                    .iter()
+                    .find_map(|event| match event {
+                        CampaignEvent::ActionRejected(reason) => Some(reason.clone()),
+                        _ => None,
+                    });
+                self.process_simulation_outcome(outcome);
+                rejected.map_or_else(
+                    || lab_shop_json(&self.campaign),
+                    |reason| lab_error_json(&reason),
+                )
+            }
             LabCommand::Move { direction, count } => {
                 for _ in 0..count {
                     self.move_player(direction, false);
@@ -995,13 +1087,87 @@ impl State {
                     self.move_inventory_selection(1);
                     true
                 }
+                InputAction::Move(Direction::West) => {
+                    self.adjust_inventory_quantity(-1);
+                    true
+                }
+                InputAction::Move(Direction::East) => {
+                    self.adjust_inventory_quantity(1);
+                    true
+                }
                 InputAction::Button(GameplayButton::Primary) => {
                     self.activate_inventory_item();
+                    true
+                }
+                InputAction::Button(GameplayButton::Inspect) => {
+                    self.drop_inventory_item();
                     true
                 }
                 InputAction::Button(GameplayButton::Back) | InputAction::Menu => {
                     self.ui_mode = UiMode::Exploration;
                     self.input.clear();
+                    true
+                }
+                _ => false,
+            },
+            UiMode::Container => match event.action {
+                InputAction::Move(Direction::North) => {
+                    self.move_container_selection(-1);
+                    true
+                }
+                InputAction::Move(Direction::South) => {
+                    self.move_container_selection(1);
+                    true
+                }
+                InputAction::Move(Direction::West) => {
+                    self.adjust_container_quantity(-1);
+                    true
+                }
+                InputAction::Move(Direction::East) => {
+                    self.adjust_container_quantity(1);
+                    true
+                }
+                InputAction::Button(GameplayButton::Inspect) => {
+                    self.switch_container_side();
+                    true
+                }
+                InputAction::Button(GameplayButton::Primary) => {
+                    self.transfer_container_item();
+                    true
+                }
+                InputAction::Button(GameplayButton::Back) | InputAction::Menu => {
+                    self.close_container();
+                    true
+                }
+                _ => false,
+            },
+            UiMode::Trade => match event.action {
+                InputAction::Move(Direction::North) => {
+                    self.move_trade_selection(-1);
+                    true
+                }
+                InputAction::Move(Direction::South) => {
+                    self.move_trade_selection(1);
+                    true
+                }
+                InputAction::Move(Direction::West) => {
+                    self.adjust_trade_quantity(-1);
+                    true
+                }
+                InputAction::Move(Direction::East) => {
+                    self.adjust_trade_quantity(1);
+                    true
+                }
+                InputAction::Button(GameplayButton::Inspect) => {
+                    self.switch_trade_direction();
+                    true
+                }
+                InputAction::Button(GameplayButton::Primary) => {
+                    self.execute_trade();
+                    true
+                }
+                InputAction::Button(GameplayButton::Back) | InputAction::Menu => {
+                    self.close_trade();
                     true
                 }
                 _ => false,
@@ -1381,6 +1547,10 @@ impl State {
         }) else {
             return;
         };
+        if topic.kind == ConversationTopicKind::Trade {
+            self.open_trade(speaker);
+            return;
+        }
 
         let response = topic.response.clone();
         let outcome = self.campaign.apply_command(CampaignCommand::Talk {
@@ -1395,6 +1565,114 @@ impl State {
         if accepted && let Some(active) = self.active_conversation.as_mut() {
             active.response = Some(response);
         }
+    }
+
+    fn open_trade(&mut self, merchant: PersonId) {
+        if merchant != self.campaign.site_plan().shop.merchant {
+            self.push_message("This person has no ordinary goods to trade.");
+            return;
+        }
+        self.active_conversation = None;
+        self.active_trade = Some(ActiveTrade {
+            merchant,
+            selected: 0,
+            direction: TradeDirection::Buy,
+            quantity: 1,
+        });
+        self.ui_mode = UiMode::Trade;
+        self.input.clear();
+    }
+
+    fn trade_item_ids(&self, direction: TradeDirection) -> Vec<ItemId> {
+        let shop = &self.campaign.site_plan().shop;
+        self.campaign.trade_items(shop.merchant, direction)
+    }
+
+    fn move_trade_selection(&mut self, offset: isize) {
+        let Some(active) = self.active_trade.as_ref() else {
+            return;
+        };
+        let count = self.trade_item_ids(active.direction).len();
+        if count == 0 {
+            return;
+        }
+        if let Some(active) = self.active_trade.as_mut() {
+            active.selected =
+                (active.selected as isize + offset).rem_euclid(count as isize) as usize;
+            active.quantity = 1;
+        }
+    }
+
+    fn switch_trade_direction(&mut self) {
+        if let Some(active) = self.active_trade.as_mut() {
+            active.direction = match active.direction {
+                TradeDirection::Buy => TradeDirection::Sell,
+                TradeDirection::Sell => TradeDirection::Buy,
+            };
+            active.selected = 0;
+            active.quantity = 1;
+        }
+    }
+
+    fn adjust_trade_quantity(&mut self, offset: i16) {
+        let Some((selected, direction, current)) = self
+            .active_trade
+            .as_ref()
+            .map(|trade| (trade.selected, trade.direction, trade.quantity))
+        else {
+            return;
+        };
+        let maximum = self
+            .trade_item_ids(direction)
+            .get(selected)
+            .and_then(|item| self.campaign.simulation().item(*item))
+            .map(|item| item.quantity)
+            .unwrap_or(1);
+        if let Some(active) = self.active_trade.as_mut() {
+            active.quantity =
+                (i32::from(current) + i32::from(offset)).clamp(1, i32::from(maximum)) as u16;
+        }
+    }
+
+    fn execute_trade(&mut self) {
+        let Some((merchant, selected, direction, quantity)) =
+            self.active_trade.as_ref().map(|trade| {
+                (
+                    trade.merchant,
+                    trade.selected,
+                    trade.direction,
+                    trade.quantity,
+                )
+            })
+        else {
+            return;
+        };
+        let Some(item) = self.trade_item_ids(direction).get(selected).copied() else {
+            self.push_message(match direction {
+                TradeDirection::Buy => "The merchant has no lawful stock left.",
+                TradeDirection::Sell => "You have no lawful ordinary goods to sell.",
+            });
+            return;
+        };
+        let outcome = self.campaign.apply_command(CampaignCommand::TradeQuantity {
+            merchant,
+            item,
+            direction,
+            quantity,
+        });
+        self.process_simulation_outcome(outcome);
+        let count = self.trade_item_ids(direction).len();
+        if let Some(active) = self.active_trade.as_mut() {
+            active.selected = active.selected.min(count.saturating_sub(1));
+            active.quantity = 1;
+        }
+    }
+
+    fn close_trade(&mut self) {
+        self.active_trade = None;
+        self.ui_mode = UiMode::Exploration;
+        self.input.clear();
+        self.push_message("You close the merchant's ledger.");
     }
 
     fn close_conversation(&mut self) {
@@ -1670,6 +1948,183 @@ impl State {
         self.input.clear();
     }
 
+    fn open_nearby_container(&mut self) -> bool {
+        let player = self.campaign.simulation().player().position;
+        let nearby = self
+            .campaign
+            .simulation()
+            .containers()
+            .filter_map(|container| {
+                let position = self
+                    .campaign
+                    .simulation()
+                    .entity(container.entity)?
+                    .position;
+                let distance = (position.grid.x - player.grid.x).abs()
+                    + (position.grid.y - player.grid.y).abs();
+                (position.map == player.map && position.grid.z == player.grid.z && distance <= 1)
+                    .then_some((distance, container.entity))
+            })
+            .min()
+            .map(|(_, entity)| entity);
+        let Some(entity) = nearby else {
+            return false;
+        };
+        if self
+            .campaign
+            .simulation()
+            .container(entity)
+            .is_some_and(|container| container.locked)
+        {
+            let lock_code = self
+                .campaign
+                .simulation()
+                .container(entity)
+                .and_then(|container| container.lock_code);
+            let key = self
+                .campaign
+                .simulation()
+                .player_inventory()
+                .into_iter()
+                .flat_map(|inventory| inventory.items.iter().copied())
+                .find(|item| {
+                    self.campaign.simulation().item(*item).is_some_and(
+                        |item| matches!(item.kind, ItemKind::Key { lock_code: code } if Some(code) == lock_code),
+                    )
+                });
+            let Some(key) = key else {
+                let name = self
+                    .campaign
+                    .simulation()
+                    .container(entity)
+                    .map(|container| container.name.as_str())
+                    .unwrap_or("container");
+                self.push_message(format!("The {name} is locked."));
+                return true;
+            };
+            let outcome = self
+                .campaign
+                .apply_game_command(GameCommand::UnlockContainer {
+                    container: entity,
+                    key,
+                });
+            self.process_simulation_outcome(outcome);
+        }
+        let outcome = self
+            .campaign
+            .apply_game_command(GameCommand::OpenContainer(entity));
+        let opened = outcome.simulation.events.iter().any(
+            |event| matches!(event, SimulationEvent::ContainerOpened { container } if *container == entity),
+        );
+        self.process_simulation_outcome(outcome);
+        if opened {
+            self.active_container = Some(ActiveContainer {
+                entity,
+                selected: 0,
+                side: ContainerSide::Contents,
+                quantity: 1,
+            });
+            self.ui_mode = UiMode::Container;
+            self.input.clear();
+        }
+        true
+    }
+
+    fn active_container_item_ids(&self, side: ContainerSide) -> Vec<ItemId> {
+        let owner = match side {
+            ContainerSide::Contents => self.active_container.as_ref().map(|active| active.entity),
+            ContainerSide::Pack => Some(self.campaign.simulation().player_id()),
+        };
+        owner
+            .and_then(|owner| self.campaign.simulation().inventory(owner))
+            .map(|inventory| inventory.items.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn move_container_selection(&mut self, offset: isize) {
+        let Some(active) = self.active_container.as_ref() else {
+            return;
+        };
+        let count = self.active_container_item_ids(active.side).len();
+        if count == 0 {
+            return;
+        }
+        if let Some(active) = self.active_container.as_mut() {
+            active.selected =
+                (active.selected as isize + offset).rem_euclid(count as isize) as usize;
+            active.quantity = 1;
+        }
+    }
+
+    fn switch_container_side(&mut self) {
+        if let Some(active) = self.active_container.as_mut() {
+            active.side = match active.side {
+                ContainerSide::Contents => ContainerSide::Pack,
+                ContainerSide::Pack => ContainerSide::Contents,
+            };
+            active.selected = 0;
+            active.quantity = 1;
+        }
+    }
+
+    fn adjust_container_quantity(&mut self, offset: i16) {
+        let Some((selected, side, current)) = self
+            .active_container
+            .as_ref()
+            .map(|container| (container.selected, container.side, container.quantity))
+        else {
+            return;
+        };
+        let maximum = self
+            .active_container_item_ids(side)
+            .get(selected)
+            .and_then(|item| self.campaign.simulation().item(*item))
+            .map(|item| item.quantity)
+            .unwrap_or(1);
+        if let Some(active) = self.active_container.as_mut() {
+            active.quantity =
+                (i32::from(current) + i32::from(offset)).clamp(1, i32::from(maximum)) as u16;
+        }
+    }
+
+    fn transfer_container_item(&mut self) {
+        let Some((container, selected, side, quantity)) = self
+            .active_container
+            .as_ref()
+            .map(|active| (active.entity, active.selected, active.side, active.quantity))
+        else {
+            return;
+        };
+        let Some(item) = self.active_container_item_ids(side).get(selected).copied() else {
+            return;
+        };
+        let command = match side {
+            ContainerSide::Contents => GameCommand::TakeQuantity {
+                item,
+                from: container,
+                quantity,
+            },
+            ContainerSide::Pack => GameCommand::PlaceQuantity {
+                item,
+                container,
+                quantity,
+            },
+        };
+        let outcome = self.campaign.apply_game_command(command);
+        self.process_simulation_outcome(outcome);
+        let count = self.active_container_item_ids(side).len();
+        if let Some(active) = self.active_container.as_mut() {
+            active.selected = active.selected.min(count.saturating_sub(1));
+            active.quantity = 1;
+        }
+    }
+
+    fn close_container(&mut self) {
+        self.active_container = None;
+        self.ui_mode = UiMode::Exploration;
+        self.input.clear();
+    }
+
     fn inventory_item_ids(&self) -> Vec<ItemId> {
         self.campaign
             .simulation()
@@ -1685,6 +2140,18 @@ impl State {
         }
         self.inventory_selected =
             (self.inventory_selected as isize + offset).rem_euclid(count as isize) as usize;
+        self.inventory_quantity = 1;
+    }
+
+    fn adjust_inventory_quantity(&mut self, offset: i16) {
+        let maximum = self
+            .inventory_item_ids()
+            .get(self.inventory_selected)
+            .and_then(|item| self.campaign.simulation().item(*item))
+            .map(|item| item.quantity)
+            .unwrap_or(1);
+        self.inventory_quantity = (i32::from(self.inventory_quantity) + i32::from(offset))
+            .clamp(1, i32::from(maximum)) as u16;
     }
 
     fn activate_inventory_item(&mut self) {
@@ -1703,6 +2170,17 @@ impl State {
                 GameCommand::Equip(item)
             }
             ItemKind::Consumable { .. } => GameCommand::UseItem(item),
+            ItemKind::Food { .. } => GameCommand::Eat(item),
+            ItemKind::Drink { .. } => GameCommand::Drink(item),
+            ItemKind::Book { .. } => GameCommand::Read(item),
+            ItemKind::Key { .. } => {
+                self.push_message("Use this key while inspecting its matching locked container.");
+                return;
+            }
+            ItemKind::Tool => {
+                self.push_message("This tool has no direct use in the current situation.");
+                return;
+            }
             ItemKind::Ammunition { .. } => {
                 self.push_message("Ammunition is consumed by its matching ranged weapon.");
                 return;
@@ -1733,6 +2211,24 @@ impl State {
         };
         let outcome = self.campaign.apply_game_command(command);
         self.process_simulation_outcome(outcome);
+    }
+
+    fn drop_inventory_item(&mut self) {
+        let Some(item) = self
+            .inventory_item_ids()
+            .get(self.inventory_selected)
+            .copied()
+        else {
+            return;
+        };
+        let outcome = self.campaign.apply_game_command(GameCommand::DropQuantity {
+            item,
+            quantity: self.inventory_quantity,
+        });
+        self.process_simulation_outcome(outcome);
+        let count = self.inventory_item_ids().len();
+        self.inventory_selected = self.inventory_selected.min(count.saturating_sub(1));
+        self.inventory_quantity = 1;
     }
 
     fn process_simulation_outcome(&mut self, outcome: CampaignOutcome) {
@@ -1822,17 +2318,33 @@ impl State {
                         self.push_message(format!("You receive {name}."));
                     }
                 }
+                SimulationEvent::ItemQuantityTransferred {
+                    item, quantity, to, ..
+                } => {
+                    if to == self.campaign.simulation().player_id() {
+                        let name = self
+                            .campaign
+                            .simulation()
+                            .item(item)
+                            .map(|item| item.name.as_str())
+                            .unwrap_or("item");
+                        self.push_message(format!("You receive {name} x{quantity}."));
+                    }
+                }
                 SimulationEvent::ItemConsumed {
                     owner,
                     item,
                     remaining,
                 } => {
                     if owner == self.campaign.simulation().player_id()
-                        && self
-                            .campaign
-                            .simulation()
-                            .item(item)
-                            .is_some_and(|item| matches!(item.kind, ItemKind::Consumable { .. }))
+                        && self.campaign.simulation().item(item).is_some_and(|item| {
+                            matches!(
+                                item.kind,
+                                ItemKind::Consumable { .. }
+                                    | ItemKind::Food { .. }
+                                    | ItemKind::Drink { .. }
+                            )
+                        })
                     {
                         let name = self
                             .campaign
@@ -1844,6 +2356,43 @@ impl State {
                         self.push_message(format!("{name}: {remaining} remaining."));
                     }
                 }
+                SimulationEvent::ContainerOpened { .. } => {}
+                SimulationEvent::ContainerUnlocked { container, .. } => {
+                    let name = self
+                        .campaign
+                        .simulation()
+                        .container(container)
+                        .map(|container| container.name.as_str())
+                        .unwrap_or("container");
+                    self.push_message(format!("You unlock the {name}."));
+                }
+                SimulationEvent::ItemDropped { item, .. } => {
+                    let name = self
+                        .campaign
+                        .simulation()
+                        .item(item)
+                        .map(|item| item.name.as_str())
+                        .unwrap_or("item");
+                    self.push_message(format!("You drop {name}."));
+                }
+                SimulationEvent::ItemRead {
+                    item,
+                    newly_learned,
+                    ..
+                } => {
+                    let name = self
+                        .campaign
+                        .simulation()
+                        .item(item)
+                        .map(|item| item.name.as_str())
+                        .unwrap_or("book");
+                    self.push_message(if newly_learned {
+                        format!("You read {name} and record what you learned.")
+                    } else {
+                        format!("You reread {name}.")
+                    });
+                }
+                SimulationEvent::NeedsChanged { .. } => {}
                 SimulationEvent::Healed {
                     entity,
                     amount,
@@ -1990,6 +2539,28 @@ impl State {
                         aid_method_name(method)
                     ));
                 }
+                CampaignEvent::ItemTraded {
+                    item,
+                    direction,
+                    quantity,
+                    price,
+                    ..
+                } => {
+                    let name = self
+                        .campaign
+                        .simulation()
+                        .item(item)
+                        .map(|item| item.name.as_str())
+                        .unwrap_or("item");
+                    self.push_message(match direction {
+                        TradeDirection::Buy => {
+                            format!("You buy {name} x{quantity} for {price} coin.")
+                        }
+                        TradeDirection::Sell => {
+                            format!("You sell {name} x{quantity} for {price} coin.")
+                        }
+                    });
+                }
                 CampaignEvent::AidDelivered {
                     patient, method, ..
                 } => {
@@ -2115,6 +2686,9 @@ impl State {
     }
 
     fn inspect(&mut self) {
+        if self.open_nearby_container() {
+            return;
+        }
         let player = self.campaign.simulation().player().position;
         if player.map == self.campaign.site_plan().regional_map {
             let nearby_party = self
@@ -2505,6 +3079,8 @@ impl State {
                 self.draw_conversation_overlay(&mut ui, width, height, scale);
             }
             UiMode::Inventory => self.draw_inventory_overlay(&mut ui, width, height, scale),
+            UiMode::Container => self.draw_container_overlay(&mut ui, width, height, scale),
+            UiMode::Trade => self.draw_trade_overlay(&mut ui, width, height, scale),
             UiMode::Resolution => self.draw_resolution_overlay(&mut ui, width, height, scale),
             UiMode::Exploration | UiMode::Targeting => {}
         }
@@ -2645,10 +3221,17 @@ impl State {
             progression.experience,
             progression.experience_for_next_level()
         );
-        let status = format!(
+        let mut status = format!(
             "{progress}   HEALTH {health}   COIN {}\nMELEE  {melee}\nRANGED  {ranged} / {arrows}",
             self.campaign.progress().player_coin
         );
+        let needs = self.campaign.simulation().player_needs();
+        if needs.hunger >= 60 || needs.thirst >= 60 {
+            status.push_str(&format!(
+                "\nNEEDS  HUNGER {}  THIRST {}",
+                needs.hunger, needs.thirst
+            ));
+        }
         let threat =
             self.campaign
                 .simulation()
@@ -3615,6 +4198,11 @@ impl State {
             .player_combatant()
             .map(|combatant| format!("HEALTH {}/{}", combatant.health, combatant.max_health))
             .unwrap_or_else(|| "HEALTH --".to_string());
+        let needs = self.campaign.simulation().player_needs();
+        let health = format!(
+            "{health}   HUNGER {}   THIRST {}",
+            needs.hunger, needs.thirst
+        );
         ui.text(
             UiRect::new(
                 panel.x + 24.0 * scale,
@@ -3730,6 +4318,19 @@ impl State {
                     ItemKind::Consumable { healing } => {
                         format!("FIELD SUPPLY\nRESTORES  {healing} HEALTH")
                     }
+                    ItemKind::Food { nourishment } => {
+                        format!("FOOD\nRELIEVES  {nourishment} HUNGER")
+                    }
+                    ItemKind::Drink { hydration } => {
+                        format!("DRINK\nRELIEVES  {hydration} THIRST")
+                    }
+                    ItemKind::Book { subject } => {
+                        format!("READABLE RECORD\nSUBJECT  {subject:?}")
+                    }
+                    ItemKind::Key { lock_code } => {
+                        format!("KEY\nLOCK MARK  {lock_code:016X}")
+                    }
+                    ItemKind::Tool => "ORDINARY TOOL".to_string(),
                     ItemKind::Reagent { material } => {
                         format!("MAGICAL REAGENT\nSOURCE  {:?}", material.source())
                     }
@@ -3772,8 +4373,13 @@ impl State {
                     "Ordinary travel gear without recorded provenance."
                 };
                 format!(
-                    "{}\n\n{}\n\nWEIGHT  {} G\nQUALITY  {}\n\n{}",
-                    item.name, use_text, item.weight_grams, item.quality, provenance
+                    "{}\n\n{}\n\nSELECTED AMOUNT  {}\nWEIGHT  {} G\nQUALITY  {}\n\n{}",
+                    item.name,
+                    use_text,
+                    self.inventory_quantity.min(item.quantity),
+                    item.weight_grams,
+                    item.quality,
+                    provenance
                 )
             })
             .unwrap_or_else(|| "Your inventory is empty.".to_string());
@@ -3797,6 +4403,289 @@ impl State {
             UiTextStyle {
                 color: [0.65, 0.82, 0.92, 1.0],
                 pixel_scale: 2.0 * scale,
+                line_spacing: 4.0 * scale,
+            },
+        );
+    }
+
+    fn draw_container_overlay(&self, ui: &mut UiDrawList, width: f32, height: f32, scale: f32) {
+        let Some(active) = self.active_container.as_ref() else {
+            return;
+        };
+        let Some(container) = self.campaign.simulation().container(active.entity) else {
+            return;
+        };
+        let items = self.active_container_item_ids(active.side);
+        let used = self
+            .campaign
+            .simulation()
+            .container_weight(active.entity)
+            .unwrap_or_default();
+        ui.rect(
+            UiRect::new(0.0, 0.0, width, height),
+            [0.01, 0.015, 0.02, 0.78],
+        );
+        let panel = UiRect::new(width * 0.14, height * 0.10, width * 0.72, height * 0.80);
+        ui.bordered_panel(
+            panel,
+            [0.035, 0.042, 0.048, 0.99],
+            [0.72, 0.57, 0.25, 1.0],
+            3.0 * scale,
+        );
+        ui.text(
+            UiRect::new(
+                panel.x + 24.0 * scale,
+                panel.y + 20.0 * scale,
+                panel.width - 48.0 * scale,
+                30.0 * scale,
+            ),
+            &container.name,
+            UiTextStyle {
+                color: [1.0, 0.80, 0.30, 1.0],
+                pixel_scale: 3.0 * scale,
+                line_spacing: 5.0 * scale,
+            },
+        );
+        let side = match active.side {
+            ContainerSide::Contents => "CONTAINER CONTENTS",
+            ContainerSide::Pack => "YOUR PACK",
+        };
+        ui.text(
+            UiRect::new(
+                panel.x + 24.0 * scale,
+                panel.y + 58.0 * scale,
+                panel.width - 48.0 * scale,
+                22.0 * scale,
+            ),
+            format!(
+                "{side}   MOVING {}   CONTAINER WEIGHT {used}/{} G",
+                active.quantity, container.capacity_grams
+            ),
+            UiTextStyle {
+                color: [0.68, 0.86, 0.76, 1.0],
+                pixel_scale: 1.9 * scale,
+                line_spacing: 4.0 * scale,
+            },
+        );
+        let lines = if items.is_empty() {
+            "EMPTY".to_string()
+        } else {
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item_id)| {
+                    let item = self.campaign.simulation().item(*item_id)?;
+                    let cursor = if index == active.selected {
+                        "[X]"
+                    } else {
+                        "[ ]"
+                    };
+                    let title = self.campaign.simulation().legal_owner(*item_id);
+                    let legality = if title == Some(self.campaign.simulation().player_id()) {
+                        "YOURS"
+                    } else if self.campaign.simulation().is_stolen(*item_id) {
+                        "STOLEN"
+                    } else {
+                        "OWNED"
+                    };
+                    Some(format!(
+                        "{cursor} {} x{}   {legality}",
+                        item.name, item.quantity
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        ui.text(
+            UiRect::new(
+                panel.x + 24.0 * scale,
+                panel.y + 96.0 * scale,
+                panel.width - 48.0 * scale,
+                panel.height - 154.0 * scale,
+            ),
+            lines,
+            UiTextStyle {
+                pixel_scale: 2.0 * scale,
+                line_spacing: 8.0 * scale,
+                ..Default::default()
+            },
+        );
+        ui.text(
+            UiRect::new(
+                panel.x + 24.0 * scale,
+                panel.y + panel.height - 36.0 * scale,
+                panel.width - 48.0 * scale,
+                20.0 * scale,
+            ),
+            self.input_prompts.container_help(),
+            UiTextStyle {
+                color: [0.65, 0.82, 0.92, 1.0],
+                pixel_scale: 1.8 * scale,
+                line_spacing: 4.0 * scale,
+            },
+        );
+    }
+
+    fn draw_trade_overlay(&self, ui: &mut UiDrawList, width: f32, height: f32, scale: f32) {
+        let Some(active) = self.active_trade.as_ref() else {
+            return;
+        };
+        let shop = &self.campaign.site_plan().shop;
+        let item_ids = self.trade_item_ids(active.direction);
+        ui.rect(
+            UiRect::new(0.0, 0.0, width, height),
+            [0.01, 0.015, 0.02, 0.78],
+        );
+        let panel = UiRect::new(width * 0.12, height * 0.09, width * 0.76, height * 0.82);
+        ui.bordered_panel(
+            panel,
+            [0.035, 0.042, 0.048, 0.99],
+            [0.72, 0.57, 0.25, 1.0],
+            3.0 * scale,
+        );
+        ui.text(
+            UiRect::new(
+                panel.x + 24.0 * scale,
+                panel.y + 18.0 * scale,
+                panel.width - 48.0 * scale,
+                30.0 * scale,
+            ),
+            &shop.name,
+            UiTextStyle {
+                color: [1.0, 0.80, 0.30, 1.0],
+                pixel_scale: 3.0 * scale,
+                line_spacing: 5.0 * scale,
+            },
+        );
+        let direction = match active.direction {
+            TradeDirection::Buy => "BUYING FROM MERCHANT",
+            TradeDirection::Sell => "SELLING TO MERCHANT",
+        };
+        ui.text(
+            UiRect::new(
+                panel.x + 24.0 * scale,
+                panel.y + 55.0 * scale,
+                panel.width - 48.0 * scale,
+                24.0 * scale,
+            ),
+            format!(
+                "{}   YOUR COIN {}   MERCHANT COIN {}",
+                direction,
+                self.campaign.progress().player_coin,
+                self.campaign.merchant_coin(shop.merchant)
+            ),
+            UiTextStyle {
+                color: [0.68, 0.86, 0.76, 1.0],
+                pixel_scale: 1.9 * scale,
+                line_spacing: 4.0 * scale,
+            },
+        );
+        let lines = if item_ids.is_empty() {
+            match active.direction {
+                TradeDirection::Buy => "NO LAWFUL STOCK REMAINS".to_string(),
+                TradeDirection::Sell => "NO LAWFUL ORDINARY GOODS TO SELL".to_string(),
+            }
+        } else {
+            item_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item_id)| {
+                    let item = self.campaign.simulation().item(*item_id)?;
+                    let quote = self
+                        .campaign
+                        .trade_quote_quantity(shop.merchant, *item_id, active.direction, 1)
+                        .ok()?;
+                    let cursor = if index == active.selected {
+                        "[X]"
+                    } else {
+                        "[ ]"
+                    };
+                    Some(format!(
+                        "{cursor} {} x{}   {} COIN EACH",
+                        item.name, item.quantity, quote.price
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        ui.text(
+            UiRect::new(
+                panel.x + 24.0 * scale,
+                panel.y + 96.0 * scale,
+                panel.width * 0.52,
+                panel.height - 154.0 * scale,
+            ),
+            lines,
+            UiTextStyle {
+                pixel_scale: 2.0 * scale,
+                line_spacing: 8.0 * scale,
+                ..Default::default()
+            },
+        );
+        let detail_panel = UiRect::new(
+            panel.x + panel.width * 0.57,
+            panel.y + 90.0 * scale,
+            panel.width * 0.39,
+            panel.height - 148.0 * scale,
+        );
+        ui.bordered_panel(
+            detail_panel,
+            [0.055, 0.048, 0.035, 0.94],
+            [0.42, 0.36, 0.23, 1.0],
+            2.0 * scale,
+        );
+        let details = item_ids
+            .get(active.selected)
+            .and_then(|item_id| {
+                let item = self.campaign.simulation().item(*item_id)?;
+                let quote = self
+                    .campaign
+                    .trade_quote_quantity(
+                        shop.merchant,
+                        *item_id,
+                        active.direction,
+                        active.quantity.min(item.quantity),
+                    )
+                    .ok()?;
+                let resource = quote
+                    .resource
+                    .map(|resource| format!("{resource:?}").to_ascii_uppercase())
+                    .unwrap_or_else(|| "ORDINARY".to_string());
+                Some(format!(
+                    "{}\n\nSELECTED  {}\nPRICE  {} COIN\nIN STACK  {}\nQUALITY  {}\nWEIGHT  {} G\n\nMARKET  {}\nSUPPLY  {}\n\nPrices follow the settlement's actual stores and needs.",
+                    item.name,
+                    quote.quantity,
+                    quote.price,
+                    item.quantity,
+                    item.quality,
+                    item.weight_grams,
+                    resource,
+                    quote.scarcity.to_ascii_uppercase()
+                ))
+            })
+            .unwrap_or_else(|| {
+                "Change between BUY and SELL to inspect available goods.".to_string()
+            });
+        ui.text(
+            detail_panel.inset(16.0 * scale),
+            details,
+            UiTextStyle {
+                pixel_scale: 1.9 * scale,
+                line_spacing: 5.0 * scale,
+                ..Default::default()
+            },
+        );
+        ui.text(
+            UiRect::new(
+                panel.x + 24.0 * scale,
+                panel.y + panel.height - 36.0 * scale,
+                panel.width - 48.0 * scale,
+                20.0 * scale,
+            ),
+            self.input_prompts.trade_help(),
+            UiTextStyle {
+                color: [0.65, 0.82, 0.92, 1.0],
+                pixel_scale: 1.8 * scale,
                 line_spacing: 4.0 * scale,
             },
         );
@@ -4352,6 +5241,12 @@ fn action_failure_text(reason: ActionFailure) -> String {
         ActionFailure::ExperimentFailed => {
             "The reagents react, but no stable formula emerges under these conditions.".to_string()
         }
+        ActionFailure::ContainerLocked => "The container is locked.".to_string(),
+        ActionFailure::WrongKey => "That key does not fit the lock.".to_string(),
+        ActionFailure::ContainerFull => "The container cannot hold any more.".to_string(),
+        ActionFailure::NotAContainer => "That is not a usable container.".to_string(),
+        ActionFailure::AlreadySatisfied => "You do not need that right now.".to_string(),
+        ActionFailure::InvalidQuantity => "That stack does not contain that many.".to_string(),
     }
 }
 
@@ -4425,7 +5320,11 @@ mod tests {
         );
         assert_eq!(
             prompts.inventory_help(),
-            "W / S / UP / DOWN CHOOSE   E / ENTER EQUIP / USE   ESC / P CLOSE"
+            "W / S / UP / DOWN CHOOSE   A / D AMOUNT   E / ENTER EQUIP / USE   X / L DROP   ESC / P CLOSE"
+        );
+        assert_eq!(
+            prompts.container_help(),
+            "W / S / UP / DOWN CHOOSE   A / D AMOUNT   X / L CONTENTS / PACK   E / ENTER MOVE   ESC CLOSE"
         );
         assert_eq!(
             prompts.targeting_help(),

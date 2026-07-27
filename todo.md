@@ -42,7 +42,8 @@ Remaining extensions for this priority:
 - Let non-player actors independently resolve, worsen, or exploit the situation.
 - Add law-change, relocation, betrayal, and deliberate refusal/neglect outcomes.
 - Generalize aid access into reusable commitments for other material needs.
-- Connect payments to household and shop accounts when the full economy lands.
+- Extend the new person/shop accounts into shared household budgets, debt, and
+  strategic faction treasuries.
 
 Build one situation comparable to:
 
@@ -73,6 +74,54 @@ Acceptance criteria:
 - Game Lab can complete at least three materially distinct approaches.
 
 ## Priority 2 — Ordinary Ultima-Like World Interaction
+
+Status: **quantity-aware trade and ordinary-object foundation implemented**.
+
+The current generated shop now provides:
+
+- A deterministic proprietor, physical trading-house landmark, and merchant-owned
+  stock generated from the historical settlement and its world-specific rules.
+- Player and resident coin accounts, with aid purchases and ordinary trades paying
+  the actual custodian or merchant.
+- Buy and sell quotes derived from item utility, quality, stack size, current local
+  iron/medicine reserves, monthly demand, and general shortage state.
+- Lawful custody and title transfer; the merchant cannot sell absent stock and
+  refuses goods the player carries without legal title.
+- A compact, controller-friendly Buy/Sell ledger reached through conversation,
+  with market detail on demand rather than permanent sidebar overload.
+- Shared semantic trade commands, versioned save/replay, and Game Lab
+  `shop`, `buy <item id>`, and `sell <item id>` coverage.
+- World-placed, ownership-aware containers reuse the same inventory and title
+  records as people, with weight capacity, deterministic locks, and physical keys.
+- Generated shops now contain an unlocked provision crate and locked ledger chest;
+  food, drink, tools, keys, and readable records arise from settlement context.
+- Taking, placing, dropping, reading, eating, and drinking are semantic,
+  replayable actions. Witnessed taking preserves the original title, marks the
+  object stolen, and changes faction standing.
+- Written records expose authoritative history, law, resources, or world lore;
+  they add one compact journal entry on first reading rather than repeated spam.
+- Desktop inspection opens a two-sided container/pack view, while inventory
+  supports direct use and dropping. Game Lab exposes `objects`, `take`, `place`,
+  `unlock`, `drop`, `read`, `eat`, and `drink`.
+- Divisible stacks now split deterministically for partial take, place, give,
+  drop, buy, and sell actions. Weight, legal title, stolen status, capacity, and
+  per-unit prices remain exact across the split.
+- Compatible fragments automatically recombine after transfers, keeping ordinary
+  inventories legible without sacrificing stable replay identities.
+- Desktop inventory, container, and merchant views select quantities through the
+  shared directional/button abstraction. Game Lab accepts optional quantities and
+  reports both complete-stack and unit prices.
+
+Remaining extensions for this priority:
+
+- Add restocking orders, physical suppliers, caravan delivery, and stock loss when
+  a route or shipment is destroyed.
+- Add bartering, gifting, debt, credit, stolen-goods recognition, witnesses, and
+  faction/legal reactions.
+- Expand ordinary item categories with clothing, armor, shields, valuables, and
+  craft-specific tool behavior.
+- Add nested containers, portable containers, doors, buildings, trespass, and
+  access schedules.
 
 ### Objects and Containers
 

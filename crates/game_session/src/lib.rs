@@ -12,13 +12,14 @@ use std::{
 
 use ultimate_fate_content::FormulaId;
 use ultimate_fate_core::{
-    CommandOutcome, Direction, EntityId, GameCommand, ItemId, ItemKind, QuestId, Simulation,
-    SimulationEvent,
+    BookSubject, CommandOutcome, Direction, EntityId, GameCommand, Item, ItemId, ItemKind, QuestId,
+    Simulation, SimulationEvent,
 };
 use ultimate_fate_history::{
     AidResolutionKind, ClaimId, CrisisResolutionKind, CrisisResolutionOutcome, Drive, EventId,
-    FactionId, GoalId, HistoricalEventKind, HistoryEngine, LawId, MonthSummary, PartyId, PersonId,
-    RegionalGoalApproach, RegionalGoalOutcome, RegionalGoalStatus, ResourceKind, WorldItemId,
+    FactionId, GoalId, HistoricalEventKind, HistoryEngine, LawId, MonthSummary, Occupation,
+    PartyId, PersonId, RegionalGoalApproach, RegionalGoalOutcome, RegionalGoalStatus, ResourceKind,
+    WorldItemId,
 };
 use ultimate_fate_text::{
     CampaignStart, Conversation, ConversationContext, ConversationTopic, ConversationTopicKind,
@@ -49,7 +50,25 @@ pub struct CampaignProgress {
     pub aid_acquisition: Option<AidResolutionKind>,
     pub aid_aftermath_event: Option<EventId>,
     pub player_coin: i64,
+    pub person_coin: BTreeMap<PersonId, i64>,
     pub aftermath_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum TradeDirection {
+    Buy,
+    Sell,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeQuote {
+    pub item: ItemId,
+    pub merchant: PersonId,
+    pub direction: TradeDirection,
+    pub quantity: u16,
+    pub price: i64,
+    pub resource: Option<ResourceKind>,
+    pub scarcity: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -152,6 +171,17 @@ pub enum CampaignCommand {
         person: PersonId,
         topic: ConversationTopicKind,
     },
+    Trade {
+        merchant: PersonId,
+        item: ItemId,
+        direction: TradeDirection,
+    },
+    TradeQuantity {
+        merchant: PersonId,
+        item: ItemId,
+        direction: TradeDirection,
+        quantity: u16,
+    },
     InspectEvidence(EventId),
     InspectHistoricalSite(EventId),
     ResolveCrisis(CrisisResolutionKind),
@@ -186,6 +216,13 @@ pub enum CampaignEvent {
         item: ItemId,
         from: PersonId,
         method: AidResolutionKind,
+    },
+    ItemTraded {
+        item: ItemId,
+        merchant: PersonId,
+        direction: TradeDirection,
+        quantity: u16,
+        price: i64,
     },
     AidDelivered {
         patient: PersonId,
@@ -296,6 +333,25 @@ impl CampaignSession {
                 )
             })
             .collect();
+        let person_coin = site_plan
+            .residents
+            .iter()
+            .map(|resident| {
+                let person = &history.world().people()[&resident.person];
+                let family = &history.world().families()[&person.family];
+                let occupational_float = match person.occupation {
+                    Occupation::Merchant => 75,
+                    Occupation::Official | Occupation::Innkeeper => 35,
+                    Occupation::Healer | Occupation::Smith => 25,
+                    Occupation::Guard | Occupation::Priest | Occupation::Miller => 15,
+                    Occupation::Farmer | Occupation::Laborer => 8,
+                };
+                (
+                    resident.person,
+                    (i64::from(family.wealth.max(0)) / 4 + occupational_float).max(0),
+                )
+            })
+            .collect();
 
         Ok(Self {
             history,
@@ -304,6 +360,7 @@ impl CampaignSession {
             simulation,
             progress: CampaignProgress {
                 player_coin: 30,
+                person_coin,
                 ..CampaignProgress::default()
             },
             resident_agents,
@@ -332,6 +389,150 @@ impl CampaignSession {
 
     pub fn progress(&self) -> &CampaignProgress {
         &self.progress
+    }
+
+    pub fn merchant_coin(&self, merchant: PersonId) -> i64 {
+        self.progress
+            .person_coin
+            .get(&merchant)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn trade_items(&self, merchant: PersonId, direction: TradeDirection) -> Vec<ItemId> {
+        self.simulation
+            .items()
+            .map(|item| item.id)
+            .filter(|item| self.trade_quote(merchant, *item, direction).is_ok())
+            .collect()
+    }
+
+    /// Quotes the lawful exchange of one complete inventory stack.
+    ///
+    /// Prices observe the current historical settlement state, so production,
+    /// shortages, relief, and later economic modules can alter ordinary trade
+    /// without the renderer owning a parallel economy.
+    pub fn trade_quote(
+        &self,
+        merchant: PersonId,
+        item: ItemId,
+        direction: TradeDirection,
+    ) -> Result<TradeQuote, String> {
+        let quantity = self
+            .simulation
+            .item(item)
+            .map(|item| item.quantity)
+            .ok_or_else(|| "the item no longer exists".to_string())?;
+        self.trade_quote_quantity(merchant, item, direction, quantity)
+    }
+
+    /// Quotes a chosen number of units without splitting or mutating the stack.
+    pub fn trade_quote_quantity(
+        &self,
+        merchant: PersonId,
+        item: ItemId,
+        direction: TradeDirection,
+        quantity: u16,
+    ) -> Result<TradeQuote, String> {
+        let shop = &self.site_plan.shop;
+        if merchant != shop.merchant {
+            return Err("that person is not operating a local shop".to_string());
+        }
+        let player = self.simulation.player_id();
+        let source = match direction {
+            TradeDirection::Buy => self
+                .merchant_item_custodian(item)
+                .ok_or_else(|| "the merchant no longer carries that item".to_string())?,
+            TradeDirection::Sell => player,
+        };
+        if !self
+            .simulation
+            .inventory(source)
+            .is_some_and(|inventory| inventory.items.contains(&item))
+        {
+            return Err(match direction {
+                TradeDirection::Buy => "the merchant no longer carries that item".to_string(),
+                TradeDirection::Sell => "you are not carrying that item".to_string(),
+            });
+        }
+        let legal_owner = self.simulation.legal_owner(item);
+        let expected_owner = match direction {
+            TradeDirection::Buy => shop.merchant_entity,
+            TradeDirection::Sell => player,
+        };
+        if legal_owner != Some(expected_owner) {
+            return Err(match direction {
+                TradeDirection::Buy => "the merchant cannot convey lawful title".to_string(),
+                TradeDirection::Sell => "you do not hold lawful title to that item".to_string(),
+            });
+        }
+        if direction == TradeDirection::Sell && self.simulation.is_stolen(item) {
+            return Err("the merchant refuses stolen goods".to_string());
+        }
+        let item_state = self
+            .simulation
+            .item(item)
+            .ok_or_else(|| "the item no longer exists".to_string())?;
+        if quantity == 0 || quantity > item_state.quantity {
+            return Err(format!(
+                "requested {quantity} units but the stack contains {}",
+                item_state.quantity
+            ));
+        }
+        let mut quoted_item = item_state.clone();
+        quoted_item.quantity = quantity;
+        let base = trade_base_value(&quoted_item).ok_or_else(|| {
+            "historical and inscribed artifacts are not ordinary trade goods".to_string()
+        })?;
+        let resource = trade_resource(item_state.kind);
+        let (multiplier, scarcity) = resource.map_or((100, "ordinary"), |resource| {
+            let world = self.history.world();
+            let site = &world.sites()[&self.site_plan.site];
+            let settlement = &world.regional_settlements()[&self.site_plan.site];
+            let reserve = site.resources.get(&resource).copied().unwrap_or_default();
+            let need = settlement
+                .monthly_consumption
+                .get(&resource)
+                .copied()
+                .unwrap_or(1)
+                .max(1);
+            scarcity_multiplier(reserve, need, settlement.shortage)
+        });
+        let buy_price = (base.saturating_mul(multiplier) + 99) / 100;
+        let price = match direction {
+            TradeDirection::Buy => buy_price,
+            TradeDirection::Sell => (buy_price.saturating_mul(3) / 5).max(1),
+        };
+        Ok(TradeQuote {
+            item,
+            merchant,
+            direction,
+            quantity,
+            price,
+            resource,
+            scarcity,
+        })
+    }
+
+    fn merchant_item_custodian(&self, item: ItemId) -> Option<EntityId> {
+        let shop = &self.site_plan.shop;
+        if self
+            .simulation
+            .inventory(shop.merchant_entity)
+            .is_some_and(|inventory| inventory.items.contains(&item))
+        {
+            return Some(shop.merchant_entity);
+        }
+        self.simulation
+            .containers()
+            .filter(|container| container.owner == shop.merchant_entity && !container.locked)
+            .filter(|container| {
+                self.simulation
+                    .inventory(container.entity)
+                    .is_some_and(|inventory| inventory.items.contains(&item))
+            })
+            .map(|container| container.entity)
+            .min()
     }
 
     /// Projects player-facing commitments from authoritative world state.
@@ -549,6 +750,18 @@ impl CampaignSession {
         let mut conversation =
             Conversation::for_person(self.history.world(), &self.campaign_start, person, context)
                 .map_err(|error| error.to_string())?;
+        if person == self.site_plan.shop.merchant {
+            conversation.topics.push(ConversationTopic {
+                kind: ConversationTopicKind::Trade,
+                prompt: format!("Browse the goods at {}.", self.site_plan.shop.name),
+                response: format!(
+                    "{} opens the stock ledger and names the day's prices.",
+                    self.site_plan.shop.merchant_name
+                ),
+                reveals_events: Vec::new(),
+                reveals_claims: Vec::new(),
+            });
+        }
         if self.aid_delivery().is_some() {
             return Ok(conversation);
         }
@@ -649,18 +862,19 @@ impl CampaignSession {
 
         let ordinary_limit = 7_usize.saturating_sub(actions.len());
         conversation.topics.sort_by_key(|topic| match topic.kind {
-            ConversationTopicKind::Evidence(_) => 0,
-            ConversationTopicKind::Orientation => 1,
-            ConversationTopicKind::Aftermath(_) => 2,
-            ConversationTopicKind::PresentCrisis => 3,
-            ConversationTopicKind::Law(_) => 4,
-            ConversationTopicKind::FactionView => 5,
-            ConversationTopicKind::Claim(_) => 6,
+            ConversationTopicKind::Trade => 0,
+            ConversationTopicKind::Evidence(_) => 1,
+            ConversationTopicKind::Orientation => 2,
+            ConversationTopicKind::Aftermath(_) => 3,
+            ConversationTopicKind::PresentCrisis => 4,
+            ConversationTopicKind::Law(_) => 5,
+            ConversationTopicKind::FactionView => 6,
+            ConversationTopicKind::Claim(_) => 7,
             ConversationTopicKind::RequestAid(_)
             | ConversationTopicKind::OfferPayment(_)
             | ConversationTopicKind::OfferAid(_)
             | ConversationTopicKind::SupportAid(_)
-            | ConversationTopicKind::TakeAid(_) => 7,
+            | ConversationTopicKind::TakeAid(_) => 8,
         });
         conversation.topics.truncate(ordinary_limit);
         conversation.topics.extend(actions);
@@ -785,6 +999,24 @@ impl CampaignSession {
             CampaignCommand::Interact => self.interact(),
             CampaignCommand::InspectHere => self.inspect_here(),
             CampaignCommand::Talk { person, topic } => self.resolve_conversation(person, topic),
+            CampaignCommand::Trade {
+                merchant,
+                item,
+                direction,
+            } => {
+                let quantity = self
+                    .simulation
+                    .item(item)
+                    .map(|item| item.quantity)
+                    .unwrap_or_default();
+                self.resolve_trade(merchant, item, direction, quantity)
+            }
+            CampaignCommand::TradeQuantity {
+                merchant,
+                item,
+                direction,
+                quantity,
+            } => self.resolve_trade(merchant, item, direction, quantity),
             CampaignCommand::InspectEvidence(event) => self.inspect_evidence(event),
             CampaignCommand::InspectHistoricalSite(event) => self.inspect_historical_site(event),
             CampaignCommand::ResolveCrisis(kind) => self.resolve_crisis(kind),
@@ -955,6 +1187,15 @@ impl CampaignSession {
         else {
             return rejected(format!("{} cannot discuss that topic", resident.name));
         };
+        if topic.kind == ConversationTopicKind::Trade {
+            return CampaignOutcome {
+                campaign_events: vec![CampaignEvent::Conversation {
+                    speaker: person,
+                    topic,
+                }],
+                ..CampaignOutcome::default()
+            };
+        }
 
         let journal_before = self.campaign_start.journal.entries.len();
         self.campaign_start
@@ -1036,6 +1277,11 @@ impl CampaignSession {
                     && self.acquire_aid_medicine(AidResolutionKind::Purchased, &mut outcome)
                 {
                     self.progress.player_coin -= self.site_plan.aid.price;
+                    *self
+                        .progress
+                        .person_coin
+                        .entry(self.site_plan.aid.custodian)
+                        .or_default() += self.site_plan.aid.price;
                 }
             }
             ConversationTopicKind::TakeAid(patient)
@@ -1068,6 +1314,120 @@ impl CampaignSession {
             .entries
             .len()
             .saturating_sub(journal_before);
+        outcome
+    }
+
+    fn resolve_trade(
+        &mut self,
+        merchant: PersonId,
+        item: ItemId,
+        direction: TradeDirection,
+        quantity: u16,
+    ) -> CampaignOutcome {
+        let shop = &self.site_plan.shop;
+        if merchant != shop.merchant {
+            return rejected("that person is not operating a local shop".to_string());
+        }
+        let player_position = self.simulation.player().position;
+        let Some(merchant_position) = self
+            .simulation
+            .entity(shop.merchant_entity)
+            .map(|entity| entity.position)
+        else {
+            return rejected("the merchant is not present".to_string());
+        };
+        if player_position.map != merchant_position.map
+            || player_position.grid.z != merchant_position.grid.z
+            || manhattan(
+                player_position.grid.x,
+                player_position.grid.y,
+                merchant_position.grid.x,
+                merchant_position.grid.y,
+            ) > 1
+        {
+            return rejected(format!(
+                "{} is not close enough to trade",
+                shop.merchant_name
+            ));
+        }
+        let quote = match self.trade_quote_quantity(merchant, item, direction, quantity) {
+            Ok(quote) => quote,
+            Err(error) => return rejected(error),
+        };
+        let player = self.simulation.player_id();
+        let (from, to, title_from) = match direction {
+            TradeDirection::Buy => {
+                if self.progress.player_coin < quote.price {
+                    return rejected(format!(
+                        "the item costs {} coin; you have {}",
+                        quote.price, self.progress.player_coin
+                    ));
+                }
+                (
+                    self.merchant_item_custodian(item)
+                        .expect("buy quote established merchant custody"),
+                    player,
+                    shop.merchant_entity,
+                )
+            }
+            TradeDirection::Sell => {
+                let merchant_coin = self.merchant_coin(merchant);
+                if merchant_coin < quote.price {
+                    return rejected(format!(
+                        "{} can offer only {} coin",
+                        shop.merchant_name, merchant_coin
+                    ));
+                }
+                (player, shop.merchant_entity, player)
+            }
+        };
+        let mut transfer = match self
+            .simulation
+            .transfer_item_quantity(item, from, to, quantity)
+        {
+            Ok(event) => event,
+            Err(error) => return rejected(format!("the exchange failed: {error:?}")),
+        };
+        let moved_item = match &transfer {
+            SimulationEvent::ItemQuantityTransferred { item, .. }
+            | SimulationEvent::ItemTransferred { item, .. } => *item,
+            _ => unreachable!("trade transfer returned a non-transfer event"),
+        };
+        if !self
+            .simulation
+            .transfer_legal_ownership(moved_item, title_from, to)
+        {
+            return rejected(
+                "custody changed but lawful title could not be transferred".to_string(),
+            );
+        }
+        let moved_item = self.simulation.merge_compatible_stack(to, moved_item);
+        if let SimulationEvent::ItemQuantityTransferred { item, .. } = &mut transfer {
+            *item = moved_item;
+        }
+        let merchant_coin = self.progress.person_coin.entry(merchant).or_default();
+        match direction {
+            TradeDirection::Buy => {
+                self.progress.player_coin -= quote.price;
+                *merchant_coin += quote.price;
+            }
+            TradeDirection::Sell => {
+                self.progress.player_coin += quote.price;
+                *merchant_coin -= quote.price;
+            }
+        }
+        let mut outcome = CampaignOutcome::default();
+        outcome.simulation.changed_world = true;
+        outcome.simulation.events.push(transfer);
+        outcome.campaign_events.push(CampaignEvent::ItemTraded {
+            item: moved_item,
+            merchant,
+            direction,
+            quantity,
+            price: quote.price,
+        });
+        let time = self.apply_game_command_unlogged(GameCommand::Wait);
+        outcome.absorb(time);
         outcome
     }
 
@@ -1406,11 +1766,13 @@ impl CampaignSession {
             )
         });
         let recovered_world_item = outcome.simulation.events.iter().any(|event| {
-            let SimulationEvent::ItemTransferred { item, to, .. } = event else {
-                return false;
+            let (item, to) = match event {
+                SimulationEvent::ItemTransferred { item, to, .. }
+                | SimulationEvent::ItemQuantityTransferred { item, to, .. } => (*item, *to),
+                _ => return false,
             };
-            *to == player
-                && self.simulation.item(*item).is_some_and(|item| {
+            to == player
+                && self.simulation.item(item).is_some_and(|item| {
                     matches!(
                         item.kind,
                         ItemKind::InscribedArtifact { object, .. }
@@ -1430,6 +1792,80 @@ impl CampaignSession {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let read_records = outcome
+            .simulation
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SimulationEvent::ItemRead {
+                    item,
+                    subject,
+                    newly_learned: true,
+                } => Some((*item, *subject)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (item, subject) in read_records {
+            let title = self
+                .simulation
+                .item(item)
+                .map(|item| item.name.clone())
+                .unwrap_or_else(|| "Written record".to_string());
+            let (body, events) = match subject {
+                BookSubject::LocalHistory => {
+                    let event = self.site_plan.crisis_event;
+                    self.campaign_start
+                        .journal
+                        .knowledge
+                        .known_events
+                        .insert(event);
+                    (
+                        self.history.world().events()[&event].summary.clone(),
+                        vec![event],
+                    )
+                }
+                BookSubject::Law => {
+                    let laws = self.history.world().sites()[&self.site_plan.site]
+                        .laws
+                        .values()
+                        .filter(|law| law.active)
+                        .map(|law| format!("{:?}", law.kind))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (format!("Active local restrictions: {laws}."), Vec::new())
+                }
+                BookSubject::Trade => {
+                    let resources = self.history.world().sites()[&self.site_plan.site]
+                        .resources
+                        .iter()
+                        .map(|(resource, amount)| format!("{resource:?}: {amount}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (
+                        format!(
+                            "The current supply ledger records these actual reserves: {resources}."
+                        ),
+                        Vec::new(),
+                    )
+                }
+                BookSubject::NaturalLore => (
+                    format!(
+                        "Notes concerning materials used within the {} tradition.",
+                        self.simulation.rules().magical_tradition
+                    ),
+                    Vec::new(),
+                ),
+            };
+            self.campaign_start.journal.entries.push(JournalEntry {
+                title,
+                body,
+                learned_at: self.history.world().date,
+                source: JournalSource::WrittenRecord(item.0),
+                events,
+                claims: Vec::new(),
+            });
+        }
 
         if outcome.simulation.events.iter().any(|event| {
             matches!(
@@ -1581,28 +2017,69 @@ impl CampaignSession {
     fn commit_social_consequences(&mut self, command: GameCommand, outcome: &mut CampaignOutcome) {
         let player = self.simulation.player_id();
         let transferred = |item: ItemId, from: EntityId, to: EntityId| {
-            outcome.simulation.events.iter().any(|event| {
-                matches!(
-                    event,
+            outcome
+                .simulation
+                .events
+                .iter()
+                .find_map(|event| match event {
                     SimulationEvent::ItemTransferred {
                         item: moved,
                         from: source,
                         to: destination,
-                    } if *moved == item && *source == from && *destination == to
-                )
-            })
+                    } if *moved == item && *source == from && *destination == to => Some(*moved),
+                    SimulationEvent::ItemQuantityTransferred {
+                        source: stack,
+                        item: moved,
+                        from: source,
+                        to: destination,
+                        ..
+                    } if *stack == item && *source == from && *destination == to => Some(*moved),
+                    _ => None,
+                })
         };
         let (person_entity, amount, reason) = match command {
-            GameCommand::Give { item, to } if transferred(item, player, to) => {
+            GameCommand::Give { item, to } | GameCommand::GiveQuantity { item, to, .. }
+                if transferred(item, player, to).is_some() =>
+            {
                 (to, 1, "received a voluntary gift")
             }
-            GameCommand::Take { item, from }
-                if transferred(item, from, player) && self.simulation.is_stolen(item) =>
-            {
-                if !self.progress.witnessed_thefts.insert(item) {
+            GameCommand::Take { item, from } | GameCommand::TakeQuantity { item, from, .. } => {
+                let Some(moved_item) = transferred(item, from, player) else {
+                    return;
+                };
+                if !self.simulation.is_stolen(moved_item) {
                     return;
                 }
-                (from, -10, "witnessed the outsider take another's property")
+                let witness = self
+                    .simulation
+                    .container(from)
+                    .map(|container| container.owner)
+                    .unwrap_or(from);
+                let witnessed = self
+                    .simulation
+                    .entity(witness)
+                    .zip(self.simulation.entity(player))
+                    .is_some_and(|(witness, player)| {
+                        witness.position.map == player.position.map
+                            && witness.position.grid.z == player.position.grid.z
+                            && manhattan(
+                                witness.position.grid.x,
+                                witness.position.grid.y,
+                                player.position.grid.x,
+                                player.position.grid.y,
+                            ) <= 2
+                    });
+                if !witnessed {
+                    return;
+                }
+                if !self.progress.witnessed_thefts.insert(moved_item) {
+                    return;
+                }
+                (
+                    witness,
+                    -10,
+                    "witnessed the outsider take another's property",
+                )
             }
             _ => return,
         };
@@ -1964,6 +2441,77 @@ fn drive_weight(drives: &BTreeMap<Drive, u8>, drive: Drive) -> i32 {
     i32::from(drives.get(&drive).copied().unwrap_or(25))
 }
 
+fn trade_base_value(item: &Item) -> Option<i64> {
+    let quantity = i64::from(item.quantity.max(1));
+    let quality = i64::from(item.quality);
+    match item.kind {
+        ItemKind::MeleeWeapon { damage } => {
+            Some((8 + i64::from(damage.max(0)) * 6 + quality / 8).max(1))
+        }
+        ItemKind::RangedWeapon { damage, range, .. } => {
+            Some((12 + i64::from(damage.max(0)) * 5 + i64::from(range) * 2 + quality / 8).max(1))
+        }
+        ItemKind::Ammunition { .. } => Some(quantity * (2 + quality / 30)),
+        ItemKind::Consumable { healing } => {
+            Some(quantity * (i64::from(healing.max(0)) * 3 + quality / 20).max(1))
+        }
+        ItemKind::Food { nourishment } => {
+            Some(quantity * (i64::from(nourishment) / 2 + 1 + quality / 25))
+        }
+        ItemKind::Drink { hydration } => {
+            Some(quantity * (i64::from(hydration) / 2 + 1 + quality / 25))
+        }
+        ItemKind::Book { .. } => Some(10 + quality / 5),
+        ItemKind::Key { .. } => Some(2 + quality / 20),
+        ItemKind::Tool => Some(8 + quality / 8),
+        ItemKind::Reagent { .. } => Some(quantity * (8 + quality / 10)),
+        ItemKind::InscribedArtifact { .. } | ItemKind::Artifact => None,
+    }
+}
+
+const fn trade_resource(kind: ItemKind) -> Option<ResourceKind> {
+    match kind {
+        ItemKind::MeleeWeapon { .. }
+        | ItemKind::RangedWeapon { .. }
+        | ItemKind::Ammunition { .. } => Some(ResourceKind::Iron),
+        ItemKind::Consumable { .. } | ItemKind::Reagent { .. } => Some(ResourceKind::Medicine),
+        ItemKind::Food { .. } | ItemKind::Drink { .. } => Some(ResourceKind::Food),
+        ItemKind::Book { .. } => Some(ResourceKind::Timber),
+        ItemKind::Key { .. } | ItemKind::Tool => Some(ResourceKind::Iron),
+        ItemKind::InscribedArtifact { .. } | ItemKind::Artifact => None,
+    }
+}
+
+fn scarcity_multiplier(
+    reserve: i64,
+    monthly_need: i64,
+    general_shortage: bool,
+) -> (i64, &'static str) {
+    let need = monthly_need.max(1);
+    let mut multiplier = if reserve <= 0 {
+        200
+    } else if reserve.saturating_mul(2) < need {
+        175
+    } else if reserve < need {
+        150
+    } else if reserve < need.saturating_mul(2) {
+        125
+    } else {
+        100
+    };
+    if general_shortage {
+        multiplier = (multiplier + 25).min(225);
+    }
+    let label = match multiplier {
+        0..=100 => "well supplied",
+        101..=125 => "tight supply",
+        126..=150 => "scarce",
+        151..=175 => "very scarce",
+        _ => "crisis price",
+    };
+    (multiplier, label)
+}
+
 fn rejected(reason: String) -> CampaignOutcome {
     CampaignOutcome {
         campaign_events: vec![CampaignEvent::ActionRejected(reason)],
@@ -1985,9 +2533,41 @@ fn encode_command(command: CampaignCommand) -> String {
             GameCommand::Give { item, to } => {
                 format!("GAME|GIVE|{}|{}", item.0, to.0)
             }
+            GameCommand::GiveQuantity { item, to, quantity } => {
+                format!("GAME|GIVE_QUANTITY|{}|{}|{}", item.0, to.0, quantity)
+            }
             GameCommand::Take { item, from } => {
                 format!("GAME|TAKE|{}|{}", item.0, from.0)
             }
+            GameCommand::TakeQuantity {
+                item,
+                from,
+                quantity,
+            } => format!("GAME|TAKE_QUANTITY|{}|{}|{}", item.0, from.0, quantity),
+            GameCommand::OpenContainer(container) => {
+                format!("GAME|OPEN_CONTAINER|{}", container.0)
+            }
+            GameCommand::UnlockContainer { container, key } => {
+                format!("GAME|UNLOCK_CONTAINER|{}|{}", container.0, key.0)
+            }
+            GameCommand::Place { item, container } => {
+                format!("GAME|PLACE|{}|{}", item.0, container.0)
+            }
+            GameCommand::PlaceQuantity {
+                item,
+                container,
+                quantity,
+            } => format!(
+                "GAME|PLACE_QUANTITY|{}|{}|{}",
+                item.0, container.0, quantity
+            ),
+            GameCommand::Drop(item) => format!("GAME|DROP|{}", item.0),
+            GameCommand::DropQuantity { item, quantity } => {
+                format!("GAME|DROP_QUANTITY|{}|{}", item.0, quantity)
+            }
+            GameCommand::Read(item) => format!("GAME|READ|{}", item.0),
+            GameCommand::Eat(item) => format!("GAME|EAT|{}", item.0),
+            GameCommand::Drink(item) => format!("GAME|DRINK|{}", item.0),
             GameCommand::Experiment { first, second } => {
                 format!("GAME|EXPERIMENT|{}|{}", first.0, second.0)
             }
@@ -2008,6 +2588,28 @@ fn encode_command(command: CampaignCommand) -> String {
         CampaignCommand::Talk { person, topic } => {
             format!("TALK|{}|{}", person.0, encode_topic(topic))
         }
+        CampaignCommand::Trade {
+            merchant,
+            item,
+            direction,
+        } => format!(
+            "TRADE|{}|{}|{}",
+            encode_trade_direction(direction),
+            merchant.0,
+            item.0
+        ),
+        CampaignCommand::TradeQuantity {
+            merchant,
+            item,
+            direction,
+            quantity,
+        } => format!(
+            "TRADE_QUANTITY|{}|{}|{}|{}",
+            encode_trade_direction(direction),
+            merchant.0,
+            item.0,
+            quantity
+        ),
         CampaignCommand::InspectEvidence(event) => {
             format!("INSPECT_EVIDENCE|{}", event.0)
         }
@@ -2048,10 +2650,62 @@ fn decode_command(line: &str) -> Result<CampaignCommand, String> {
             item: ItemId(parse_u64(item, "item id")?),
             to: EntityId(parse_u64(to, "recipient entity id")?),
         })),
+        ["GAME", "GIVE_QUANTITY", item, to, quantity] => {
+            Ok(CampaignCommand::Game(GameCommand::GiveQuantity {
+                item: ItemId(parse_u64(item, "item id")?),
+                to: EntityId(parse_u64(to, "recipient entity id")?),
+                quantity: parse_u16(quantity, "quantity")?,
+            }))
+        }
         ["GAME", "TAKE", item, from] => Ok(CampaignCommand::Game(GameCommand::Take {
             item: ItemId(parse_u64(item, "item id")?),
             from: EntityId(parse_u64(from, "source entity id")?),
         })),
+        ["GAME", "TAKE_QUANTITY", item, from, quantity] => {
+            Ok(CampaignCommand::Game(GameCommand::TakeQuantity {
+                item: ItemId(parse_u64(item, "item id")?),
+                from: EntityId(parse_u64(from, "source entity id")?),
+                quantity: parse_u16(quantity, "quantity")?,
+            }))
+        }
+        ["GAME", "OPEN_CONTAINER", container] => Ok(CampaignCommand::Game(
+            GameCommand::OpenContainer(EntityId(parse_u64(container, "container entity id")?)),
+        )),
+        ["GAME", "UNLOCK_CONTAINER", container, key] => {
+            Ok(CampaignCommand::Game(GameCommand::UnlockContainer {
+                container: EntityId(parse_u64(container, "container entity id")?),
+                key: ItemId(parse_u64(key, "key item id")?),
+            }))
+        }
+        ["GAME", "PLACE", item, container] => Ok(CampaignCommand::Game(GameCommand::Place {
+            item: ItemId(parse_u64(item, "item id")?),
+            container: EntityId(parse_u64(container, "container entity id")?),
+        })),
+        ["GAME", "PLACE_QUANTITY", item, container, quantity] => {
+            Ok(CampaignCommand::Game(GameCommand::PlaceQuantity {
+                item: ItemId(parse_u64(item, "item id")?),
+                container: EntityId(parse_u64(container, "container entity id")?),
+                quantity: parse_u16(quantity, "quantity")?,
+            }))
+        }
+        ["GAME", "DROP", item] => Ok(CampaignCommand::Game(GameCommand::Drop(ItemId(parse_u64(
+            item, "item id",
+        )?)))),
+        ["GAME", "DROP_QUANTITY", item, quantity] => {
+            Ok(CampaignCommand::Game(GameCommand::DropQuantity {
+                item: ItemId(parse_u64(item, "item id")?),
+                quantity: parse_u16(quantity, "quantity")?,
+            }))
+        }
+        ["GAME", "READ", item] => Ok(CampaignCommand::Game(GameCommand::Read(ItemId(parse_u64(
+            item, "item id",
+        )?)))),
+        ["GAME", "EAT", item] => Ok(CampaignCommand::Game(GameCommand::Eat(ItemId(parse_u64(
+            item, "item id",
+        )?)))),
+        ["GAME", "DRINK", item] => Ok(CampaignCommand::Game(GameCommand::Drink(ItemId(
+            parse_u64(item, "item id")?,
+        )))),
         ["GAME", "EXPERIMENT", first, second] => {
             Ok(CampaignCommand::Game(GameCommand::Experiment {
                 first: ItemId(parse_u64(first, "first reagent item id")?),
@@ -2081,6 +2735,19 @@ fn decode_command(line: &str) -> Result<CampaignCommand, String> {
             person: PersonId(parse_u64(person, "person id")?),
             topic: decode_topic(topic)?,
         }),
+        ["TRADE", direction, merchant, item] => Ok(CampaignCommand::Trade {
+            merchant: PersonId(parse_u64(merchant, "merchant person id")?),
+            item: ItemId(parse_u64(item, "trade item id")?),
+            direction: decode_trade_direction(direction)?,
+        }),
+        ["TRADE_QUANTITY", direction, merchant, item, quantity] => {
+            Ok(CampaignCommand::TradeQuantity {
+                merchant: PersonId(parse_u64(merchant, "merchant person id")?),
+                item: ItemId(parse_u64(item, "trade item id")?),
+                direction: decode_trade_direction(direction)?,
+                quantity: parse_u16(quantity, "quantity")?,
+            })
+        }
         ["INSPECT_EVIDENCE", event] => Ok(CampaignCommand::InspectEvidence(EventId(parse_u64(
             event, "event id",
         )?))),
@@ -2126,6 +2793,7 @@ fn encode_topic(topic: ConversationTopicKind) -> String {
         ConversationTopicKind::Law(law) => format!("LAW:{}", law.0),
         ConversationTopicKind::Evidence(event) => format!("EVIDENCE:{}", event.0),
         ConversationTopicKind::Aftermath(event) => format!("AFTERMATH:{}", event.0),
+        ConversationTopicKind::Trade => "TRADE".to_string(),
         ConversationTopicKind::RequestAid(person) => format!("REQUEST_AID:{}", person.0),
         ConversationTopicKind::OfferPayment(person) => format!("PAY_AID:{}", person.0),
         ConversationTopicKind::OfferAid(person) => format!("OFFER_AID:{}", person.0),
@@ -2139,6 +2807,7 @@ fn decode_topic(value: &str) -> Result<ConversationTopicKind, String> {
         "ORIENTATION" => Ok(ConversationTopicKind::Orientation),
         "CRISIS" => Ok(ConversationTopicKind::PresentCrisis),
         "FACTION" => Ok(ConversationTopicKind::FactionView),
+        "TRADE" => Ok(ConversationTopicKind::Trade),
         _ => {
             let Some((kind, id)) = value.split_once(':') else {
                 return Err(format!("invalid conversation topic `{value}`"));
@@ -2157,6 +2826,21 @@ fn decode_topic(value: &str) -> Result<ConversationTopicKind, String> {
                 _ => Err(format!("invalid conversation topic `{value}`")),
             }
         }
+    }
+}
+
+const fn encode_trade_direction(direction: TradeDirection) -> &'static str {
+    match direction {
+        TradeDirection::Buy => "BUY",
+        TradeDirection::Sell => "SELL",
+    }
+}
+
+fn decode_trade_direction(value: &str) -> Result<TradeDirection, String> {
+    match value {
+        "BUY" => Ok(TradeDirection::Buy),
+        "SELL" => Ok(TradeDirection::Sell),
+        _ => Err(format!("invalid trade direction `{value}`")),
     }
 }
 
@@ -2212,6 +2896,12 @@ fn parse_u64(value: &str, label: &str) -> Result<u64, String> {
         .map_err(|_| format!("{label} `{value}` is not a valid unsigned integer"))
 }
 
+fn parse_u16(value: &str, label: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid {label} `{value}`"))
+}
+
 fn parse_usize(value: &str, label: &str) -> Result<usize, String> {
     value
         .parse()
@@ -2225,7 +2915,55 @@ fn manhattan(first_x: i32, first_y: i32, second_x: i32, second_y: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ultimate_fate_core::{Direction, GameCommand};
+    use ultimate_fate_core::{Direction, GameCommand, GridPos};
+
+    fn navigate_to_shop(session: &mut CampaignSession) {
+        for _ in 0..256 {
+            let target = session
+                .simulation
+                .entity(session.site_plan.shop.merchant_entity)
+                .expect("merchant")
+                .position;
+            let player = session.simulation.player().position;
+            if player.map == target.map
+                && player.grid.z == target.grid.z
+                && manhattan(player.grid.x, player.grid.y, target.grid.x, target.grid.y) <= 1
+            {
+                return;
+            }
+            let map = session.simulation.map(player.map).expect("map");
+            let mut queue = std::collections::VecDeque::from([player.grid]);
+            let mut previous = BTreeMap::<GridPos, (GridPos, Direction)>::new();
+            let mut seen = BTreeSet::from([player.grid]);
+            let mut destination = None;
+            while let Some(current) = queue.pop_front() {
+                if manhattan(current.x, current.y, target.grid.x, target.grid.y) <= 1 {
+                    destination = Some(current);
+                    break;
+                }
+                for direction in Direction::ALL {
+                    let (dx, dy) = direction.delta();
+                    let next = current.offset(dx, dy, 0);
+                    if !seen.insert(next) || map.cell(next).is_none_or(|cell| cell.movement_blocked)
+                    {
+                        continue;
+                    }
+                    previous.insert(next, (current, direction));
+                    queue.push_back(next);
+                }
+            }
+            let mut current = destination.expect("shop is reachable");
+            let mut first = None;
+            while current != player.grid {
+                let (parent, direction) = previous[&current];
+                first = Some(direction);
+                current = parent;
+            }
+            let direction = first.expect("shop path has a step");
+            session.apply_game_command(GameCommand::Move(direction));
+        }
+        panic!("merchant did not remain reachable");
+    }
 
     #[test]
     fn campaign_owns_one_ruleset_and_advances_all_world_layers() {
@@ -2319,10 +3057,42 @@ mod tests {
                 item: ItemId(21),
                 to: EntityId(22),
             }),
+            CampaignCommand::Game(GameCommand::GiveQuantity {
+                item: ItemId(21),
+                to: EntityId(22),
+                quantity: 2,
+            }),
             CampaignCommand::Game(GameCommand::Take {
                 item: ItemId(23),
                 from: EntityId(24),
             }),
+            CampaignCommand::Game(GameCommand::TakeQuantity {
+                item: ItemId(23),
+                from: EntityId(24),
+                quantity: 3,
+            }),
+            CampaignCommand::Game(GameCommand::OpenContainer(EntityId(40))),
+            CampaignCommand::Game(GameCommand::UnlockContainer {
+                container: EntityId(41),
+                key: ItemId(42),
+            }),
+            CampaignCommand::Game(GameCommand::Place {
+                item: ItemId(43),
+                container: EntityId(44),
+            }),
+            CampaignCommand::Game(GameCommand::PlaceQuantity {
+                item: ItemId(43),
+                container: EntityId(44),
+                quantity: 4,
+            }),
+            CampaignCommand::Game(GameCommand::Drop(ItemId(45))),
+            CampaignCommand::Game(GameCommand::DropQuantity {
+                item: ItemId(45),
+                quantity: 5,
+            }),
+            CampaignCommand::Game(GameCommand::Read(ItemId(46))),
+            CampaignCommand::Game(GameCommand::Eat(ItemId(47))),
+            CampaignCommand::Game(GameCommand::Drink(ItemId(48))),
             CampaignCommand::Game(GameCommand::Experiment {
                 first: ItemId(25),
                 second: ItemId(26),
@@ -2377,6 +3147,26 @@ mod tests {
                 person: PersonId(26),
                 topic: ConversationTopicKind::TakeAid(PersonId(27)),
             },
+            CampaignCommand::Talk {
+                person: PersonId(27),
+                topic: ConversationTopicKind::Trade,
+            },
+            CampaignCommand::Trade {
+                merchant: PersonId(28),
+                item: ItemId(29),
+                direction: TradeDirection::Buy,
+            },
+            CampaignCommand::Trade {
+                merchant: PersonId(30),
+                item: ItemId(31),
+                direction: TradeDirection::Sell,
+            },
+            CampaignCommand::TradeQuantity {
+                merchant: PersonId(30),
+                item: ItemId(31),
+                direction: TradeDirection::Sell,
+                quantity: 6,
+            },
             CampaignCommand::InspectEvidence(EventId(28)),
             CampaignCommand::InspectHistoricalSite(EventId(29)),
             CampaignCommand::ResolveCrisis(CrisisResolutionKind::BrokerCompromise),
@@ -2403,6 +3193,168 @@ mod tests {
             .err()
             .expect("truncated");
         assert!(truncated.contains("declares 1 commands"));
+    }
+
+    #[test]
+    fn trade_moves_money_custody_and_title_and_replays_exactly() {
+        let mut session = CampaignSession::with_history_years(0x55aa_2026, 3).expect("campaign");
+        navigate_to_shop(&mut session);
+        let merchant = session.site_plan.shop.merchant;
+        let item = session
+            .site_plan
+            .shop
+            .stock
+            .iter()
+            .map(|item| item.id)
+            .filter_map(|item| {
+                session
+                    .trade_quote(merchant, item, TradeDirection::Buy)
+                    .ok()
+                    .map(|quote| (quote.price, item))
+            })
+            .min()
+            .expect("shop stock");
+        assert!(item.0 <= session.progress.player_coin);
+        let player = session.simulation.player_id();
+        let merchant_entity = session.site_plan.shop.merchant_entity;
+        let player_coin = session.progress.player_coin;
+        let merchant_coin = session.merchant_coin(merchant);
+        let outcome = session.apply_command(CampaignCommand::Trade {
+            merchant,
+            item: item.1,
+            direction: TradeDirection::Buy,
+        });
+        assert!(outcome.campaign_events.iter().any(|event| matches!(
+            event,
+            CampaignEvent::ItemTraded {
+                item: traded,
+                direction: TradeDirection::Buy,
+                ..
+            } if *traded == item.1
+        )));
+        assert_eq!(session.progress.player_coin, player_coin - item.0);
+        assert_eq!(session.merchant_coin(merchant), merchant_coin + item.0);
+        assert_eq!(session.simulation.legal_owner(item.1), Some(player));
+        assert!(
+            session
+                .simulation
+                .player_inventory()
+                .is_some_and(|inventory| inventory.items.contains(&item.1))
+        );
+        assert!(
+            session
+                .simulation
+                .inventory(merchant_entity)
+                .is_none_or(|inventory| !inventory.items.contains(&item.1))
+        );
+
+        let save = session.save_to_string();
+        let loaded = CampaignSession::load_from_str(&save).expect("trade replay");
+        assert_eq!(loaded.command_log(), session.command_log());
+        assert_eq!(loaded.simulation(), session.simulation());
+        assert_eq!(loaded.progress(), session.progress());
+        assert_eq!(loaded.history().world(), session.history().world());
+    }
+
+    #[test]
+    fn partial_trade_splits_a_stack_charges_exact_units_and_replays() {
+        let mut session = CampaignSession::with_history_years(0x5151, 2).expect("campaign");
+        navigate_to_shop(&mut session);
+        let merchant = session.site_plan.shop.merchant;
+        let item = session
+            .trade_items(merchant, TradeDirection::Buy)
+            .into_iter()
+            .find(|item| {
+                session
+                    .simulation
+                    .item(*item)
+                    .is_some_and(|item| item.quantity >= 3)
+                    && session
+                        .trade_quote_quantity(merchant, *item, TradeDirection::Buy, 2)
+                        .is_ok_and(|quote| quote.price <= session.progress.player_coin)
+            })
+            .expect("divisible affordable shop stock");
+        let original_quantity = session.simulation.item(item).unwrap().quantity;
+        let quote = session
+            .trade_quote_quantity(merchant, item, TradeDirection::Buy, 2)
+            .expect("partial quote");
+        let player_coin = session.progress.player_coin;
+        let outcome = session.apply_command(CampaignCommand::TradeQuantity {
+            merchant,
+            item,
+            direction: TradeDirection::Buy,
+            quantity: 2,
+        });
+        let moved = outcome
+            .campaign_events
+            .iter()
+            .find_map(|event| match event {
+                CampaignEvent::ItemTraded {
+                    item,
+                    quantity: 2,
+                    price,
+                    ..
+                } if *price == quote.price => Some(*item),
+                _ => None,
+            })
+            .expect("quantity trade event");
+        assert_eq!(
+            session.simulation.item(item).unwrap().quantity,
+            original_quantity - 2
+        );
+        assert_eq!(session.simulation.item(moved).unwrap().quantity, 2);
+        assert_eq!(
+            session.simulation.legal_owner(moved),
+            Some(session.simulation.player_id())
+        );
+        assert_eq!(session.progress.player_coin, player_coin - quote.price);
+
+        let save = session.save_to_string();
+        let loaded = CampaignSession::load_from_str(&save).expect("partial trade replay");
+        assert_eq!(loaded.command_log(), session.command_log());
+        assert_eq!(loaded.simulation(), session.simulation());
+        assert_eq!(loaded.progress(), session.progress());
+    }
+
+    #[test]
+    fn trade_refuses_insufficient_funds_and_goods_without_player_title() {
+        let mut session = CampaignSession::with_history_years(91, 0).expect("campaign");
+        navigate_to_shop(&mut session);
+        let merchant = session.site_plan.shop.merchant;
+        let merchant_entity = session.site_plan.shop.merchant_entity;
+        let stock = session.site_plan.shop.stock[0].id;
+        session.progress.player_coin = 0;
+        let outcome = session.apply_command(CampaignCommand::Trade {
+            merchant,
+            item: stock,
+            direction: TradeDirection::Buy,
+        });
+        assert!(outcome.campaign_events.iter().any(
+            |event| matches!(event, CampaignEvent::ActionRejected(reason) if reason.contains("costs"))
+        ));
+        assert_eq!(session.simulation.legal_owner(stock), Some(merchant_entity));
+
+        let loan = session.site_plan.starter_sword.id;
+        let lender = session.site_plan.contact_resident().entity;
+        session
+            .simulation
+            .transfer_item(loan, lender, session.simulation.player_id())
+            .expect("physical loan");
+        let refusal = session
+            .trade_quote(merchant, loan, TradeDirection::Sell)
+            .expect_err("loan has no player title");
+        assert!(refusal.contains("lawful title"));
+    }
+
+    #[test]
+    fn scarcity_prices_are_monotonic_and_shortages_raise_them() {
+        let abundant = scarcity_multiplier(200, 20, false).0;
+        let tight = scarcity_multiplier(15, 20, false).0;
+        let empty = scarcity_multiplier(0, 20, false).0;
+        let shortage = scarcity_multiplier(200, 20, true).0;
+        assert!(abundant < tight);
+        assert!(tight < empty);
+        assert!(abundant < shortage);
     }
 
     #[test]

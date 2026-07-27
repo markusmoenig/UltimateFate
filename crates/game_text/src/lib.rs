@@ -88,6 +88,7 @@ pub enum JournalSource {
     Resolution(EventId),
     Quest(EventId),
     WorldChange(EventId),
+    WrittenRecord(u64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +131,7 @@ pub enum ConversationTopicKind {
     Law(LawId),
     Evidence(EventId),
     Aftermath(EventId),
+    Trade,
     RequestAid(PersonId),
     OfferPayment(PersonId),
     OfferAid(PersonId),

@@ -12,15 +12,17 @@ use std::{
 
 use ultimate_fate_content::{FormulaCondition, FormulaId};
 use ultimate_fate_core::{
-    CommandOutcome, Direction, EntityId, EntityKind, GameCommand, GridPos, ItemKind, QuestStatus,
-    Simulation, SimulationEvent, TerrainKind, WorldPosition,
+    CommandOutcome, Direction, EntityId, EntityKind, GameCommand, GridPos, ItemId, ItemKind,
+    QuestStatus, Simulation, SimulationEvent, TerrainKind, WorldPosition,
 };
 use ultimate_fate_history::{
     AidResolutionKind, CrisisResolutionOutcome, FactionId, GoalId, HistoricalEventKind,
     HistoryEngine, RegionalGoalApproach, RegionalGoalKind, RegionalGoalStatus, RegionalPartyStatus,
     StrategicFront,
 };
-use ultimate_fate_session::{CampaignCommand, CampaignEvent, CampaignOutcome, CampaignSession};
+use ultimate_fate_session::{
+    CampaignCommand, CampaignEvent, CampaignOutcome, CampaignSession, TradeDirection,
+};
 use ultimate_fate_text::{ConversationContext, ConversationTopic, ConversationTopicKind};
 use ultimate_fate_worldgen::PlayableSitePlan;
 
@@ -50,6 +52,19 @@ pub enum LabCommand {
     World,
     Goals,
     Objectives,
+    Objects,
+    ObjectAction {
+        command: GameCommand,
+        target: Option<EntityId>,
+        maximum_turns: u32,
+    },
+    Shop,
+    Trade {
+        direction: TradeDirection,
+        item: ItemId,
+        quantity: Option<u16>,
+        maximum_turns: u32,
+    },
     Move {
         direction: Direction,
         count: u32,
@@ -119,6 +134,107 @@ pub fn parse_command(line: &str) -> Result<LabCommand, String> {
         "world" => Ok(LabCommand::World),
         "goals" => Ok(LabCommand::Goals),
         "objectives" | "quests" => Ok(LabCommand::Objectives),
+        "objects" | "containers" => Ok(LabCommand::Objects),
+        "take" | "place" | "unlock" => {
+            let first = parse_u64(
+                words
+                    .get(1)
+                    .ok_or_else(|| format!("{} requires identifiers", words[0]))?,
+            )?;
+            let second = parse_u64(
+                words
+                    .get(2)
+                    .ok_or_else(|| format!("{} requires two identifiers", words[0]))?,
+            )?;
+            let quantity = words
+                .get(3)
+                .map(|quantity| parse_quantity(quantity))
+                .transpose()?;
+            let (command, target) = match words[0].to_ascii_lowercase().as_str() {
+                "take" => (
+                    quantity.map_or(
+                        GameCommand::Take {
+                            item: ItemId(first),
+                            from: EntityId(second),
+                        },
+                        |quantity| GameCommand::TakeQuantity {
+                            item: ItemId(first),
+                            from: EntityId(second),
+                            quantity,
+                        },
+                    ),
+                    Some(EntityId(second)),
+                ),
+                "place" => (
+                    quantity.map_or(
+                        GameCommand::Place {
+                            item: ItemId(first),
+                            container: EntityId(second),
+                        },
+                        |quantity| GameCommand::PlaceQuantity {
+                            item: ItemId(first),
+                            container: EntityId(second),
+                            quantity,
+                        },
+                    ),
+                    Some(EntityId(second)),
+                ),
+                _ => (
+                    GameCommand::UnlockContainer {
+                        container: EntityId(first),
+                        key: ItemId(second),
+                    },
+                    Some(EntityId(first)),
+                ),
+            };
+            Ok(LabCommand::ObjectAction {
+                command,
+                target,
+                maximum_turns: 10_000,
+            })
+        }
+        "drop" | "read" | "eat" | "drink" => {
+            let item = ItemId(parse_u64(
+                words
+                    .get(1)
+                    .ok_or_else(|| format!("{} requires an item id", words[0]))?,
+            )?);
+            let quantity = words
+                .get(2)
+                .map(|quantity| parse_quantity(quantity))
+                .transpose()?;
+            let command = match words[0].to_ascii_lowercase().as_str() {
+                "drop" => quantity.map_or(GameCommand::Drop(item), |quantity| {
+                    GameCommand::DropQuantity { item, quantity }
+                }),
+                "read" => GameCommand::Read(item),
+                "eat" => GameCommand::Eat(item),
+                _ => GameCommand::Drink(item),
+            };
+            Ok(LabCommand::ObjectAction {
+                command,
+                target: None,
+                maximum_turns: 10_000,
+            })
+        }
+        "shop" | "trade" => Ok(LabCommand::Shop),
+        "buy" | "sell" => Ok(LabCommand::Trade {
+            direction: if words[0].eq_ignore_ascii_case("buy") {
+                TradeDirection::Buy
+            } else {
+                TradeDirection::Sell
+            },
+            item: ItemId(parse_u64(
+                words
+                    .get(1)
+                    .ok_or_else(|| "buy and sell require an item id".to_string())?,
+            )?),
+            quantity: words
+                .get(2)
+                .map(|quantity| parse_quantity(quantity))
+                .transpose()?,
+            maximum_turns: 10_000,
+        }),
         "move" => Ok(LabCommand::Move {
             direction: parse_direction(
                 words
@@ -199,6 +315,109 @@ fn parse_json_command(line: &str) -> Result<LabCommand, String> {
         "world" => Ok(LabCommand::World),
         "goals" => Ok(LabCommand::Goals),
         "objectives" | "quests" => Ok(LabCommand::Objectives),
+        "objects" | "containers" => Ok(LabCommand::Objects),
+        "take" | "place" | "unlock" => {
+            let item = json_u64_field(line, "item");
+            let container = json_u64_field(line, "container");
+            let key = json_u64_field(line, "key");
+            let quantity = json_quantity_field(line)?;
+            let (command, target) = match command.to_ascii_lowercase().as_str() {
+                "take" => {
+                    let container =
+                        container.ok_or_else(|| "take requires \"container\"".to_string())?;
+                    (
+                        quantity.map_or(
+                            GameCommand::Take {
+                                item: ItemId(
+                                    item.ok_or_else(|| "take requires \"item\"".to_string())?,
+                                ),
+                                from: EntityId(container),
+                            },
+                            |quantity| GameCommand::TakeQuantity {
+                                item: ItemId(item.expect("take item validated above")),
+                                from: EntityId(container),
+                                quantity,
+                            },
+                        ),
+                        Some(EntityId(container)),
+                    )
+                }
+                "place" => {
+                    let container =
+                        container.ok_or_else(|| "place requires \"container\"".to_string())?;
+                    (
+                        quantity.map_or(
+                            GameCommand::Place {
+                                item: ItemId(
+                                    item.ok_or_else(|| "place requires \"item\"".to_string())?,
+                                ),
+                                container: EntityId(container),
+                            },
+                            |quantity| GameCommand::PlaceQuantity {
+                                item: ItemId(item.expect("place item validated above")),
+                                container: EntityId(container),
+                                quantity,
+                            },
+                        ),
+                        Some(EntityId(container)),
+                    )
+                }
+                _ => {
+                    let container =
+                        container.ok_or_else(|| "unlock requires \"container\"".to_string())?;
+                    (
+                        GameCommand::UnlockContainer {
+                            container: EntityId(container),
+                            key: ItemId(key.ok_or_else(|| "unlock requires \"key\"".to_string())?),
+                        },
+                        Some(EntityId(container)),
+                    )
+                }
+            };
+            Ok(LabCommand::ObjectAction {
+                command,
+                target,
+                maximum_turns: json_u64_field(line, "maximum_turns")
+                    .unwrap_or(10_000)
+                    .clamp(1, 100_000) as u32,
+            })
+        }
+        "drop" | "read" | "eat" | "drink" => {
+            let item = ItemId(
+                json_u64_field(line, "item")
+                    .ok_or_else(|| format!("{command} requires \"item\""))?,
+            );
+            let quantity = json_quantity_field(line)?;
+            let command = match command.to_ascii_lowercase().as_str() {
+                "drop" => quantity.map_or(GameCommand::Drop(item), |quantity| {
+                    GameCommand::DropQuantity { item, quantity }
+                }),
+                "read" => GameCommand::Read(item),
+                "eat" => GameCommand::Eat(item),
+                _ => GameCommand::Drink(item),
+            };
+            Ok(LabCommand::ObjectAction {
+                command,
+                target: None,
+                maximum_turns: 10_000,
+            })
+        }
+        "shop" | "trade" => Ok(LabCommand::Shop),
+        "buy" | "sell" => Ok(LabCommand::Trade {
+            direction: if command.eq_ignore_ascii_case("buy") {
+                TradeDirection::Buy
+            } else {
+                TradeDirection::Sell
+            },
+            item: ItemId(
+                json_u64_field(line, "item")
+                    .ok_or_else(|| "buy and sell require numeric \"item\"".to_string())?,
+            ),
+            quantity: json_quantity_field(line)?,
+            maximum_turns: json_u64_field(line, "maximum_turns")
+                .unwrap_or(10_000)
+                .clamp(1, 100_000) as u32,
+        }),
         "move" => Ok(LabCommand::Move {
             direction: parse_direction(
                 direction
@@ -280,12 +499,31 @@ fn json_u64_field(input: &str, field: &str) -> Option<u64> {
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
+fn json_quantity_field(input: &str) -> Result<Option<u16>, String> {
+    let Some(quantity) = json_u64_field(input, "quantity") else {
+        return Ok(None);
+    };
+    u16::try_from(quantity)
+        .ok()
+        .filter(|quantity| *quantity > 0)
+        .map(Some)
+        .ok_or_else(|| "quantity must be between 1 and 65535".to_string())
+}
+
 fn parse_u64(input: &str) -> Result<u64, String> {
     if let Some(hex) = input.strip_prefix("0x") {
         u64::from_str_radix(hex, 16).map_err(|error| error.to_string())
     } else {
         input.parse::<u64>().map_err(|error| error.to_string())
     }
+}
+
+fn parse_quantity(input: &str) -> Result<u16, String> {
+    input
+        .parse::<u16>()
+        .ok()
+        .filter(|quantity| *quantity > 0)
+        .ok_or_else(|| format!("invalid quantity `{input}`"))
 }
 
 fn parse_direction(input: &str) -> Result<Direction, String> {
@@ -589,6 +827,25 @@ impl LabSession {
                 self.campaign.simulation(),
             ),
             LabCommand::Objectives => self.objectives_json(),
+            LabCommand::Objects => objects_json(&self.campaign),
+            LabCommand::ObjectAction {
+                command,
+                target,
+                maximum_turns,
+            } => match self.execute_object_action(command, target, maximum_turns) {
+                Ok(()) => objects_json(&self.campaign),
+                Err(error) => error_json(&error),
+            },
+            LabCommand::Shop => shop_json(&self.campaign),
+            LabCommand::Trade {
+                direction,
+                item,
+                quantity,
+                maximum_turns,
+            } => match self.execute_trade(direction, item, quantity, maximum_turns) {
+                Ok(()) => shop_json(&self.campaign),
+                Err(error) => error_json(&error),
+            },
             LabCommand::Move { direction, count } => {
                 for _ in 0..count {
                     self.apply(GameCommand::Move(direction));
@@ -819,6 +1076,16 @@ impl LabSession {
                     "Item {} acquired from person {} by {method:?}.",
                     item.0, from.0
                 )),
+                CampaignEvent::ItemTraded {
+                    item,
+                    direction,
+                    quantity,
+                    price,
+                    ..
+                } => self.push_message(format!(
+                    "{direction:?} item {} x{quantity} for {price} coin.",
+                    item.0
+                )),
                 CampaignEvent::AidDelivered {
                     patient, method, ..
                 } => self.push_message(format!(
@@ -834,6 +1101,78 @@ impl LabSession {
         self.resolved_crisis = self.campaign.progress().resolved_crisis.clone();
         self.aftermath_complete = self.campaign.progress().aftermath_complete;
         outcome
+    }
+
+    fn execute_trade(
+        &mut self,
+        direction: TradeDirection,
+        item: ItemId,
+        quantity: Option<u16>,
+        maximum_turns: u32,
+    ) -> Result<(), String> {
+        let merchant = self.campaign.site_plan().shop.merchant;
+        let quantity = quantity.unwrap_or_else(|| {
+            self.campaign
+                .simulation()
+                .item(item)
+                .map(|item| item.quantity)
+                .unwrap_or_default()
+        });
+        self.campaign
+            .trade_quote_quantity(merchant, item, direction, quantity)?;
+        let merchant_entity = self.campaign.site_plan().shop.merchant_entity;
+        let starting_tick = self.campaign.simulation().tick;
+        self.navigate_adjacent_to_entity(merchant_entity, starting_tick, maximum_turns)?;
+        let outcome = self.apply_campaign(CampaignCommand::TradeQuantity {
+            merchant,
+            item,
+            direction,
+            quantity,
+        });
+        if outcome.campaign_events.iter().any(|event| {
+            matches!(
+                event,
+                CampaignEvent::ItemTraded {
+                    merchant: seller,
+                    direction: traded_direction,
+                    quantity: traded_quantity,
+                    ..
+                } if *seller == merchant
+                    && *traded_direction == direction
+                    && *traded_quantity == quantity
+            )
+        }) {
+            Ok(())
+        } else {
+            Err(campaign_rejection(&outcome))
+        }
+    }
+
+    fn execute_object_action(
+        &mut self,
+        command: GameCommand,
+        target: Option<EntityId>,
+        maximum_turns: u32,
+    ) -> Result<(), String> {
+        if let Some(target) = target {
+            let starting_tick = self.campaign.simulation().tick;
+            self.navigate_adjacent_to_entity(target, starting_tick, maximum_turns)?;
+        }
+        let outcome = self.apply_campaign(CampaignCommand::Game(command));
+        if outcome
+            .simulation
+            .events
+            .iter()
+            .any(|event| matches!(event, SimulationEvent::ActionFailed(_)))
+            || outcome
+                .campaign_events
+                .iter()
+                .any(|event| matches!(event, CampaignEvent::ActionRejected(_)))
+        {
+            Err(campaign_rejection(&outcome))
+        } else {
+            Ok(())
+        }
     }
 
     fn pursue_goal(
@@ -2109,6 +2448,11 @@ pub fn observation_json(
                 ItemKind::RangedWeapon { .. } => "ranged_weapon",
                 ItemKind::Ammunition { .. } => "ammunition",
                 ItemKind::Consumable { .. } => "consumable",
+                ItemKind::Food { .. } => "food",
+                ItemKind::Drink { .. } => "drink",
+                ItemKind::Book { .. } => "book",
+                ItemKind::Key { .. } => "key",
+                ItemKind::Tool => "tool",
                 ItemKind::Reagent { .. } => "reagent",
                 ItemKind::InscribedArtifact { .. } => "inscribed_artifact",
                 ItemKind::Artifact => "artifact",
@@ -2696,6 +3040,11 @@ pub fn help_json() -> String {
         "{\"ok\":true,\"type\":\"help\",\"commands\":[",
         "\"observe [radius]\",\"move <north|east|south|west> [count]\",",
         "\"interact\",\"wait [turns]\",\"explore [turns]\",\"metrics\",",
+        "\"shop\",\"buy <item> [quantity]\",\"sell <item> [quantity]\",",
+        "\"objects\",\"take <item> <container> [quantity]\",",
+        "\"place <item> <container> [quantity]\",",
+        "\"unlock <container> <key>\",\"drop <item> [quantity]\",\"read <item>\",",
+        "\"eat <item>\",\"drink <item>\",",
         "\"inspect\",\"study\",\"experiment <item id> <item id>\",",
         "\"cast [formula id]\",\"goto <landmark name>\",\"world\",\"goals\",",
         "\"pursue [goal index] [option index]\",\"objectives\",",
@@ -2704,6 +3053,128 @@ pub fn help_json() -> String {
         "\"json_example\":{\"command\":\"move\",\"direction\":\"east\",\"count\":10}}"
     )
     .to_string()
+}
+
+pub fn objects_json(campaign: &CampaignSession) -> String {
+    let simulation = campaign.simulation();
+    let needs = simulation.player_needs();
+    let mut output = format!(
+        "{{\"ok\":true,\"type\":\"objects\",\"hunger\":{},\"thirst\":{},\"containers\":[",
+        needs.hunger, needs.thirst
+    );
+    let mut first_container = true;
+    for container in simulation.containers() {
+        let Some(position) = simulation
+            .entity(container.entity)
+            .map(|entity| entity.position)
+        else {
+            continue;
+        };
+        if !first_container {
+            output.push(',');
+        }
+        first_container = false;
+        let _ = write!(
+            output,
+            "{{\"entity\":{},\"name\":\"{}\",\"owner\":{},\"locked\":{},\
+             \"capacity_grams\":{},\"used_grams\":{},\"map\":{},\"x\":{},\"y\":{},\"items\":[",
+            container.entity.0,
+            json_escape(&container.name),
+            container.owner.0,
+            container.locked,
+            container.capacity_grams,
+            simulation
+                .container_weight(container.entity)
+                .unwrap_or_default(),
+            position.map.0,
+            position.grid.x,
+            position.grid.y
+        );
+        let mut first_item = true;
+        for item_id in simulation
+            .inventory(container.entity)
+            .into_iter()
+            .flat_map(|inventory| inventory.items.iter())
+        {
+            let Some(item) = simulation.item(*item_id) else {
+                continue;
+            };
+            if !first_item {
+                output.push(',');
+            }
+            first_item = false;
+            let _ = write!(
+                output,
+                "{{\"id\":{},\"name\":\"{}\",\"quantity\":{},\"legal_owner\":{},\"stolen\":{}}}",
+                item.id.0,
+                json_escape(&item.name),
+                item.quantity,
+                simulation
+                    .legal_owner(item.id)
+                    .map(|owner| owner.0)
+                    .unwrap_or_default(),
+                simulation.is_stolen(item.id)
+            );
+        }
+        output.push_str("]}");
+    }
+    output.push_str("]}");
+    output
+}
+
+pub fn shop_json(campaign: &CampaignSession) -> String {
+    let shop = &campaign.site_plan().shop;
+    let mut output = format!(
+        "{{\"ok\":true,\"type\":\"shop\",\"merchant\":{},\"merchant_name\":\"{}\",\
+         \"shop_name\":\"{}\",\"player_coin\":{},\"merchant_coin\":{},\"buy\":[",
+        shop.merchant.0,
+        json_escape(&shop.merchant_name),
+        json_escape(&shop.name),
+        campaign.progress().player_coin,
+        campaign.merchant_coin(shop.merchant),
+    );
+    write_trade_items(&mut output, campaign, TradeDirection::Buy);
+    output.push_str("],\"sell\":[");
+    write_trade_items(&mut output, campaign, TradeDirection::Sell);
+    output.push_str("]}");
+    output
+}
+
+fn write_trade_items(output: &mut String, campaign: &CampaignSession, direction: TradeDirection) {
+    let merchant = campaign.site_plan().shop.merchant;
+    let mut first = true;
+    for item_id in campaign.trade_items(merchant, direction) {
+        let Ok(quote) = campaign.trade_quote(merchant, item_id, direction) else {
+            continue;
+        };
+        let Some(item) = campaign.simulation().item(item_id) else {
+            continue;
+        };
+        let unit_price = campaign
+            .trade_quote_quantity(merchant, item_id, direction, 1)
+            .map(|quote| quote.price)
+            .unwrap_or(quote.price);
+        if !first {
+            output.push(',');
+        }
+        first = false;
+        let resource = quote
+            .resource
+            .map(|resource| format!("{resource:?}").to_ascii_lowercase())
+            .unwrap_or_else(|| "none".to_string());
+        let _ = write!(
+            output,
+            "{{\"item\":{},\"name\":\"{}\",\"quantity\":{},\"price\":{},\"unit_price\":{},\
+             \"scarcity\":\"{}\",\"resource\":\"{}\"}}",
+            item.id.0,
+            json_escape(&item.name),
+            item.quantity,
+            quote.price,
+            unit_price,
+            quote.scarcity,
+            resource
+        );
+    }
 }
 
 pub fn error_json(error: &str) -> String {
@@ -3036,6 +3507,69 @@ mod tests {
                 maximum_turns: 750,
             })
         );
+        assert_eq!(parse_command("shop"), Ok(LabCommand::Shop));
+        assert_eq!(
+            parse_command("sell 3"),
+            Ok(LabCommand::Trade {
+                direction: TradeDirection::Sell,
+                item: ItemId(3),
+                quantity: None,
+                maximum_turns: 10_000,
+            })
+        );
+        assert_eq!(
+            parse_command(r#"{"command":"buy","item":7,"maximum_turns":500}"#),
+            Ok(LabCommand::Trade {
+                direction: TradeDirection::Buy,
+                item: ItemId(7),
+                quantity: None,
+                maximum_turns: 500,
+            })
+        );
+        assert_eq!(
+            parse_command("buy 7 3"),
+            Ok(LabCommand::Trade {
+                direction: TradeDirection::Buy,
+                item: ItemId(7),
+                quantity: Some(3),
+                maximum_turns: 10_000,
+            })
+        );
+        assert_eq!(parse_command("objects"), Ok(LabCommand::Objects));
+        assert_eq!(
+            parse_command("take 9 12"),
+            Ok(LabCommand::ObjectAction {
+                command: GameCommand::Take {
+                    item: ItemId(9),
+                    from: EntityId(12),
+                },
+                target: Some(EntityId(12)),
+                maximum_turns: 10_000,
+            })
+        );
+        assert_eq!(
+            parse_command("take 9 12 2"),
+            Ok(LabCommand::ObjectAction {
+                command: GameCommand::TakeQuantity {
+                    item: ItemId(9),
+                    from: EntityId(12),
+                    quantity: 2,
+                },
+                target: Some(EntityId(12)),
+                maximum_turns: 10_000,
+            })
+        );
+        assert_eq!(
+            parse_command(r#"{"command":"unlock","container":12,"key":8}"#),
+            Ok(LabCommand::ObjectAction {
+                command: GameCommand::UnlockContainer {
+                    container: EntityId(12),
+                    key: ItemId(8),
+                },
+                target: Some(EntityId(12)),
+                maximum_turns: 10_000,
+            })
+        );
     }
 
     #[test]
@@ -3048,6 +3582,195 @@ mod tests {
         let metrics = session.execute(LabCommand::Explore { turns: 200 });
         assert!(metrics.contains("\"type\":\"metrics\""));
         assert!(session.simulation().tick > 0);
+    }
+
+    #[test]
+    fn game_lab_observes_and_executes_replayable_lawful_trade() {
+        let mut session = LabSession::new(DEFAULT_SEED).expect("lab session");
+        let shop = session.execute(LabCommand::Shop);
+        assert!(shop.contains("\"type\":\"shop\""));
+        assert!(shop.contains("\"buy\":["));
+        assert!(shop.contains("\"sell\":["));
+        let merchant = session.site_plan().shop.merchant;
+        let item = session
+            .simulation()
+            .player_inventory()
+            .expect("inventory")
+            .items
+            .iter()
+            .copied()
+            .find(|item| {
+                session
+                    .trade_quote(merchant, *item, TradeDirection::Sell)
+                    .is_ok()
+            })
+            .expect("lawful sellable item");
+        let response = session.execute(LabCommand::Trade {
+            direction: TradeDirection::Sell,
+            item,
+            quantity: None,
+            maximum_turns: 2_000,
+        });
+        assert!(response.contains("\"ok\":true"), "{response}");
+        assert_eq!(
+            session.simulation().legal_owner(item),
+            Some(session.site_plan().shop.merchant_entity)
+        );
+        let response = session.execute(LabCommand::Trade {
+            direction: TradeDirection::Buy,
+            item,
+            quantity: None,
+            maximum_turns: 2_000,
+        });
+        assert!(response.contains("\"ok\":true"), "{response}");
+        assert_eq!(
+            session.simulation().legal_owner(item),
+            Some(session.simulation().player_id())
+        );
+
+        let save = session.campaign.save_to_string();
+        let loaded = CampaignSession::load_from_str(&save).expect("trade replay");
+        assert_eq!(loaded.simulation(), session.campaign.simulation());
+        assert_eq!(loaded.progress(), session.campaign.progress());
+        assert_eq!(loaded.history().world(), session.campaign.history().world());
+    }
+
+    #[test]
+    fn game_lab_exercises_owned_containers_consumption_and_replay() {
+        let mut session = LabSession::new(DEFAULT_SEED).expect("lab session");
+        let objects = session.execute(LabCommand::Objects);
+        assert!(objects.contains("\"type\":\"objects\""));
+        assert!(objects.contains("\"containers\":["));
+        let planned = session
+            .site_plan()
+            .containers
+            .iter()
+            .find(|planned| !planned.container.locked)
+            .expect("unlocked container")
+            .clone();
+        let food = planned
+            .contents
+            .iter()
+            .find(|item| matches!(item.kind, ItemKind::Food { .. }))
+            .expect("food")
+            .id;
+        let hunger = session.simulation().player_needs().hunger;
+        let response = session.execute(LabCommand::ObjectAction {
+            command: GameCommand::Take {
+                item: food,
+                from: planned.container.entity,
+            },
+            target: Some(planned.container.entity),
+            maximum_turns: 2_000,
+        });
+        assert!(response.contains("\"ok\":true"), "{response}");
+        assert!(session.simulation().is_stolen(food));
+        assert_eq!(
+            session.simulation().legal_owner(food),
+            Some(planned.container.owner)
+        );
+        assert!(session.progress().witnessed_thefts.contains(&food));
+        let response = session.execute(LabCommand::ObjectAction {
+            command: GameCommand::Eat(food),
+            target: None,
+            maximum_turns: 1,
+        });
+        assert!(response.contains("\"ok\":true"), "{response}");
+        assert!(session.simulation().player_needs().hunger < hunger);
+
+        let locked = session
+            .site_plan()
+            .containers
+            .iter()
+            .find(|planned| planned.container.locked)
+            .expect("locked container")
+            .clone();
+        let key = locked.key.as_ref().expect("container key").id;
+        let response = session.execute(LabCommand::Trade {
+            direction: TradeDirection::Buy,
+            item: key,
+            quantity: None,
+            maximum_turns: 2_000,
+        });
+        assert!(response.contains("\"ok\":true"), "{response}");
+        let response = session.execute(LabCommand::ObjectAction {
+            command: GameCommand::UnlockContainer {
+                container: locked.container.entity,
+                key,
+            },
+            target: Some(locked.container.entity),
+            maximum_turns: 2_000,
+        });
+        assert!(response.contains("\"ok\":true"), "{response}");
+        let book = locked.contents[0].id;
+        let response = session.execute(LabCommand::ObjectAction {
+            command: GameCommand::Take {
+                item: book,
+                from: locked.container.entity,
+            },
+            target: Some(locked.container.entity),
+            maximum_turns: 2_000,
+        });
+        assert!(response.contains("\"ok\":true"), "{response}");
+        let journal_before = session.start().journal.entries.len();
+        let response = session.execute(LabCommand::ObjectAction {
+            command: GameCommand::Read(book),
+            target: None,
+            maximum_turns: 1,
+        });
+        assert!(response.contains("\"ok\":true"), "{response}");
+        assert_eq!(session.start().journal.entries.len(), journal_before + 1);
+        assert!(matches!(
+            session.start().journal.entries.last().map(|entry| entry.source),
+            Some(ultimate_fate_text::JournalSource::WrittenRecord(id)) if id == book.0
+        ));
+
+        let save = session.campaign.save_to_string();
+        let loaded = CampaignSession::load_from_str(&save).expect("object replay");
+        assert_eq!(loaded.simulation(), session.campaign.simulation());
+        assert_eq!(loaded.progress(), session.campaign.progress());
+        assert_eq!(loaded.history().world(), session.campaign.history().world());
+    }
+
+    #[test]
+    fn game_lab_trades_selected_stack_quantities() {
+        let mut session = LabSession::new(0x7171).expect("session");
+        let merchant = session.site_plan().shop.merchant;
+        let item = session
+            .trade_items(merchant, TradeDirection::Buy)
+            .into_iter()
+            .find(|item| {
+                session
+                    .simulation()
+                    .item(*item)
+                    .is_some_and(|item| item.quantity >= 3)
+                    && session
+                        .trade_quote_quantity(merchant, *item, TradeDirection::Buy, 2)
+                        .is_ok_and(|quote| quote.price <= session.progress().player_coin)
+            })
+            .expect("divisible stock");
+        let before = session.simulation().item(item).unwrap().quantity;
+        let response = session.execute(LabCommand::Trade {
+            direction: TradeDirection::Buy,
+            item,
+            quantity: Some(2),
+            maximum_turns: 2_000,
+        });
+        assert!(response.contains("\"ok\":true"), "{response}");
+        assert_eq!(
+            session.simulation().item(item).unwrap().quantity,
+            before - 2
+        );
+        assert!(response.contains("\"unit_price\":"), "{response}");
+        assert!(
+            session
+                .simulation()
+                .player_inventory()
+                .into_iter()
+                .flat_map(|inventory| inventory.items.iter())
+                .filter_map(|item| session.simulation().item(*item))
+                .any(|item| item.quantity == 2)
+        );
     }
 
     #[test]
